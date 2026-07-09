@@ -54,20 +54,19 @@ export default function PatronPanel() {
 /* ---------------- GENEL BAKIŞ ---------------- */
 function GenelBakis() {
   const [toplamMaliyet, setToplamMaliyet] = useState(0);
+  const [icerdekiler, setIcerdekiler] = useState(0);
   const [toplamKm, setToplamKm] = useState(0);
   const [lokasyonOzet, setLokasyonOzet] = useState([]);
-  const [icerdekiler, setIcerdekiler] = useState([]);
-  const [disardakiler, setDisardakiler] = useState([]);
 
   useEffect(() => {
     (async () => {
       const { data: veriler } = await supabase.from('saha_verileri').select('lokasyon, toplam');
+      const { count: acikSayisi } = await supabase.from('giris_cikis').select('*', { count: 'exact', head: true }).eq('durum', 'Açık');
       const { data: araclar } = await supabase.from('arac_kullanim').select('katedilen_km');
-      const { data: tumPersonel } = await supabase.from('personel').select('personel_no, ad, lokasyon').eq('rol', 'personel');
-      const { data: acikMesailer } = await supabase.from('giris_cikis').select('personel_no, giris_saati').eq('durum', 'Açık');
 
       const tm = (veriler || []).reduce((a, v) => a + Number(v.toplam), 0);
       setToplamMaliyet(tm);
+      setIcerdekiler(acikSayisi || 0);
       setToplamKm((araclar || []).reduce((a, v) => a + (Number(v.katedilen_km) || 0), 0));
 
       const grup = {};
@@ -77,17 +76,6 @@ function GenelBakis() {
         grup[v.lokasyon].toplam += Number(v.toplam);
       });
       setLokasyonOzet(Object.entries(grup).map(([lokasyon, v]) => ({ lokasyon, ...v })));
-
-      const acikMap = {};
-      (acikMesailer || []).forEach((m) => { acikMap[m.personel_no] = m.giris_saati; });
-      const icerde = [];
-      const disarda = [];
-      (tumPersonel || []).forEach((p) => {
-        if (acikMap[p.personel_no]) icerde.push({ ...p, girisSaati: acikMap[p.personel_no] });
-        else disarda.push(p);
-      });
-      setIcerdekiler(icerde);
-      setDisardakiler(disarda);
     })();
   }, []);
 
@@ -95,32 +83,9 @@ function GenelBakis() {
     <>
       <div className="grid cols-3">
         <div className="stat-card"><div className="label">Toplam maliyet</div><div className="value">{toplamMaliyet.toLocaleString('tr-TR')} TL</div></div>
-        <div className="stat-card"><div className="label">Şu an içeride</div><div className="value">{icerdekiler.length} kişi</div></div>
+        <div className="stat-card"><div className="label">Şu an içeride</div><div className="value">{icerdekiler} kişi</div></div>
         <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
       </div>
-
-      <div className="grid cols-2" style={{ marginTop: 16 }}>
-        <div className="card">
-          <h2 className="section">İçeride olanlar</h2>
-          {icerdekiler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Şu an içeride kimse yok.</div>}
-          {icerdekiler.map((p) => (
-            <div key={p.personel_no} style={{ borderBottom: '1px solid var(--border)', padding: '9px 0', fontSize: 13, display: 'flex', justifyContent: 'space-between' }}>
-              <span><span className="dot icerde" style={{ marginRight: 8 }}></span>{p.ad} · {p.lokasyon}</span>
-              <span style={{ color: 'var(--ink-soft)' }}>{new Date(p.girisSaati).toLocaleTimeString('tr-TR')}&apos;den beri</span>
-            </div>
-          ))}
-        </div>
-        <div className="card">
-          <h2 className="section">Dışarıda / çalışmayanlar</h2>
-          {disardakiler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Herkes içeride.</div>}
-          {disardakiler.map((p) => (
-            <div key={p.personel_no} style={{ borderBottom: '1px solid var(--border)', padding: '9px 0', fontSize: 13 }}>
-              <span className="dot disarda" style={{ marginRight: 8 }}></span>{p.ad} · {p.lokasyon}
-            </div>
-          ))}
-        </div>
-      </div>
-
       <div className="card" style={{ marginTop: 16 }}>
         <h2 className="section">Lokasyon bazlı maliyet</h2>
         <table>
@@ -183,13 +148,10 @@ function Lokasyonlar() {
       <div className="summary-total">{toplam.toLocaleString('tr-TR')} TL</div>
       <div className="summary-sub">{kalemler.length} kalem girildi</div>
       <table>
-        <thead><tr><th>Kalem</th><th>Personel</th><th>Miktar</th><th>Birim</th><th>Toplam</th><th>Açıklama</th></tr></thead>
+        <thead><tr><th>Kalem</th><th>Miktar</th><th>Birim</th><th>Toplam</th></tr></thead>
         <tbody>
           {kalemler.map((k) => (
-            <tr key={k.id}>
-              <td>{k.kalem_turu}</td><td>{k.ad}</td><td>{k.miktar}</td><td>{k.birim_fiyat} TL</td><td>{Number(k.toplam).toLocaleString('tr-TR')} TL</td>
-              <td style={{ color: 'var(--ink-soft)' }}>{k.aciklama || '—'}</td>
-            </tr>
+            <tr key={k.id}><td>{k.kalem_turu}</td><td>{k.miktar}</td><td>{k.birim_fiyat} TL</td><td>{Number(k.toplam).toLocaleString('tr-TR')} TL</td></tr>
           ))}
         </tbody>
       </table>
@@ -220,23 +182,14 @@ function Araclar() {
       </div>
       <h2 className="section" style={{ marginTop: 18 }}>Araç kullanım geçmişi</h2>
       <table>
-        <thead>
-          <tr>
-            <th>Tarih</th><th>Personel</th><th>Plaka</th>
-            <th>Alış saati</th><th>Alış km</th>
-            <th>Teslim saati</th><th>Teslim km</th>
-            <th>Kat edilen</th><th>Durum</th>
-          </tr>
-        </thead>
+        <thead><tr><th>Tarih</th><th>Personel</th><th>Plaka</th><th>Alış km</th><th>Teslim km</th><th>Kat edilen</th><th>Durum</th></tr></thead>
         <tbody>
           {kayitlar.map((k) => (
             <tr key={k.id}>
               <td>{new Date(k.tarih).toLocaleDateString('tr-TR')}</td>
               <td>{k.ad}</td>
               <td>{k.plaka}</td>
-              <td>{new Date(k.tarih).toLocaleTimeString('tr-TR')}</td>
               <td>{Number(k.alis_km).toLocaleString('tr-TR')}</td>
-              <td>{k.teslim_saati ? new Date(k.teslim_saati).toLocaleTimeString('tr-TR') : '—'}</td>
               <td>{k.teslim_km ? Number(k.teslim_km).toLocaleString('tr-TR') : '—'}</td>
               <td>{k.katedilen_km ? Number(k.katedilen_km).toLocaleString('tr-TR') + ' km' : '—'}</td>
               <td><span className={'status-tag' + (k.durum === 'Açık' ? ' open' : '')}>{k.durum}</span></td>

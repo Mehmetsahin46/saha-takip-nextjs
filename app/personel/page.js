@@ -46,91 +46,15 @@ export default function PersonelPanel() {
       </div>
       <div className="tabbar">
         <button className={tab === 'mesai' ? 'active-personel' : ''} onClick={() => setTab('mesai')}>Mesai</button>
-        <button className={tab === 'saatler' ? 'active-personel' : ''} onClick={() => setTab('saatler')}>Çalışma Saatlerim</button>
         <button className={tab === 'arac' ? 'active-personel' : ''} onClick={() => setTab('arac')}>Araç</button>
         <button className={tab === 'veri' ? 'active-personel' : ''} onClick={() => setTab('veri')}>Saha Verisi</button>
       </div>
       <div className="content">
         {tab === 'mesai' && <MesaiTab oturum={oturum} saat={saat} tarihMetni={tarihMetni} />}
-        {tab === 'saatler' && <SaatlerimTab oturum={oturum} />}
         {tab === 'arac' && <AracTab oturum={oturum} />}
         {tab === 'veri' && <VeriTab oturum={oturum} />}
       </div>
     </div>
-  );
-}
-
-/* ---------------- ÇALIŞMA SAATLERİM ---------------- */
-function SaatlerimTab({ oturum }) {
-  const [yukleniyor, setYukleniyor] = useState(true);
-  const [haftalik, setHaftalik] = useState(0);
-  const [aylik, setAylik] = useState(0);
-  const [yillik, setYillik] = useState(0);
-  const [gecmis, setGecmis] = useState([]);
-
-  useEffect(() => {
-    (async () => {
-      setYukleniyor(true);
-      const { data } = await supabase
-        .from('giris_cikis')
-        .select('*')
-        .eq('personel_no', oturum.personel_no)
-        .eq('durum', 'Kapalı')
-        .order('giris_saati', { ascending: false });
-
-      const kayitlar = data || [];
-      const now = new Date();
-
-      const haftaBaslangic = new Date(now);
-      haftaBaslangic.setDate(now.getDate() - 7);
-
-      const ayBaslangic = new Date(now.getFullYear(), now.getMonth(), 1);
-      const yilBaslangic = new Date(now.getFullYear(), 0, 1);
-
-      let h = 0, a = 0, y = 0;
-      kayitlar.forEach((k) => {
-        const tarih = new Date(k.giris_saati);
-        const sure = Number(k.sure_saat) || 0;
-        if (tarih >= haftaBaslangic) h += sure;
-        if (tarih >= ayBaslangic) a += sure;
-        if (tarih >= yilBaslangic) y += sure;
-      });
-
-      setHaftalik(Math.round(h * 100) / 100);
-      setAylik(Math.round(a * 100) / 100);
-      setYillik(Math.round(y * 100) / 100);
-      setGecmis(kayitlar.slice(0, 15));
-      setYukleniyor(false);
-    })();
-  }, [oturum.personel_no]);
-
-  if (yukleniyor) return <div className="loading-text">Yükleniyor...</div>;
-
-  return (
-    <>
-      <div className="grid cols-3">
-        <div className="stat-card"><div className="label">Son 7 gün</div><div className="value">{haftalik} sa</div></div>
-        <div className="stat-card"><div className="label">Bu ay</div><div className="value">{aylik} sa</div></div>
-        <div className="stat-card"><div className="label">Bu yıl</div><div className="value">{yillik} sa</div></div>
-      </div>
-      <div className="card" style={{ marginTop: 16 }}>
-        <h2 className="section">Son mesai kayıtları</h2>
-        <table>
-          <thead><tr><th>Tarih</th><th>Giriş</th><th>Çıkış</th><th>Süre</th></tr></thead>
-          <tbody>
-            {gecmis.map((k) => (
-              <tr key={k.id}>
-                <td>{new Date(k.giris_saati).toLocaleDateString('tr-TR')}</td>
-                <td>{new Date(k.giris_saati).toLocaleTimeString('tr-TR')}</td>
-                <td>{k.cikis_saati ? new Date(k.cikis_saati).toLocaleTimeString('tr-TR') : '—'}</td>
-                <td>{k.sure_saat ? k.sure_saat + ' sa' : '—'}</td>
-              </tr>
-            ))}
-            {gecmis.length === 0 && <tr><td colSpan={4}>Henüz tamamlanmış mesai kaydın yok.</td></tr>}
-          </tbody>
-        </table>
-      </div>
-    </>
   );
 }
 
@@ -169,16 +93,6 @@ function MesaiTab({ oturum, saat, tarihMetni }) {
 
   async function cikisYap() {
     setMesaj(null);
-    const { data: acikArac } = await supabase
-      .from('arac_kullanim')
-      .select('id, plaka')
-      .eq('personel_no', oturum.personel_no)
-      .eq('durum', 'Açık')
-      .maybeSingle();
-    if (acikArac) {
-      setMesaj({ tip: 'err', metin: `Önce "${acikArac.plaka}" plakalı aracı Araç sekmesinden teslim etmelisiniz.` });
-      return;
-    }
     const now = new Date();
     const girisSaati = new Date(acikKayit.giris_saati);
     const sureSaat = Math.round(((now - girisSaati) / 3600000) * 100) / 100;
@@ -272,7 +186,7 @@ function AracTab({ oturum }) {
     const katedilen = t - acikKayit.alis_km;
     const { error: e1 } = await supabase
       .from('arac_kullanim')
-      .update({ teslim_km: t, katedilen_km: katedilen, durum: 'Kapalı', teslim_saati: new Date().toISOString() })
+      .update({ teslim_km: t, katedilen_km: katedilen, durum: 'Kapalı' })
       .eq('id', acikKayit.id);
     if (e1) { setMesaj({ tip: 'err', metin: e1.message }); return; }
     await supabase.from('araclar').update({ durum: 'Boşta' }).eq('plaka', acikKayit.plaka);
