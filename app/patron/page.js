@@ -6,6 +6,16 @@ import { supabase } from '@/lib/supabase';
 
 const KM_BIRIM_MALIYET = 5; // TL / km, tahmini yakıt + aşınma
 
+// Ondalık saat değerini (örn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne çevirir.
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
+
 export default function PatronPanel() {
   const router = useRouter();
   const [oturum, setOturum] = useState(null);
@@ -36,7 +46,7 @@ export default function PatronPanel() {
       <div className="tabbar">
         <button className={tab === 'genel' ? 'active-patron' : ''} onClick={() => setTab('genel')}>Genel Bakış</button>
         <button className={tab === 'lokasyonlar' ? 'active-patron' : ''} onClick={() => setTab('lokasyonlar')}>Lokasyonlar</button>
-        <button className={tab === 'araclar' ? 'active-patron' : ''} onClick={() => setTab('araclar')}>Araçlar</button>
+        <button className={tab === 'araclar' ? 'active-patron' : ''} onClick={() => setTab('araclar')}>Araç Filosu</button>
         <button className={tab === 'projeler' ? 'active-patron' : ''} onClick={() => setTab('projeler')}>Projeler</button>
         <button className={tab === 'teklifler' ? 'active-patron' : ''} onClick={() => setTab('teklifler')}>Teklifler</button>
         <button className={tab === 'ayarlar' ? 'active-patron' : ''} onClick={() => setTab('ayarlar')}>Ayarlar</button>
@@ -59,12 +69,17 @@ function GenelBakis() {
   const [icerdekiler, setIcerdekiler] = useState(0);
   const [toplamKm, setToplamKm] = useState(0);
   const [lokasyonOzet, setLokasyonOzet] = useState([]);
+  const [saatGun, setSaatGun] = useState(0);
+  const [saatHafta, setSaatHafta] = useState(0);
+  const [saatAy, setSaatAy] = useState(0);
+  const [personelAySaat, setPersonelAySaat] = useState([]);
 
   useEffect(() => {
     (async () => {
       const { data: veriler } = await supabase.from('saha_verileri').select('lokasyon, toplam');
       const { count: acikSayisi } = await supabase.from('giris_cikis').select('*', { count: 'exact', head: true }).eq('durum', 'Açık');
       const { data: araclar } = await supabase.from('arac_kullanim').select('katedilen_km');
+      const { data: mesailer } = await supabase.from('giris_cikis').select('*').eq('durum', 'Kapalı');
 
       const tm = (veriler || []).reduce((a, v) => a + Number(v.toplam), 0);
       setToplamMaliyet(tm);
@@ -78,6 +93,29 @@ function GenelBakis() {
         grup[v.lokasyon].toplam += Number(v.toplam);
       });
       setLokasyonOzet(Object.entries(grup).map(([lokasyon, v]) => ({ lokasyon, ...v })));
+
+      const now = new Date();
+      const bugunBaslangic = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const haftaBaslangic = new Date(now);
+      haftaBaslangic.setDate(now.getDate() - 7);
+      const ayBaslangic = new Date(now.getFullYear(), now.getMonth(), 1);
+
+      let g = 0, h = 0, a = 0;
+      const kisiAy = {};
+      (mesailer || []).forEach((m) => {
+        const tarih = new Date(m.giris_saati);
+        const sure = Number(m.sure_saat) || 0;
+        if (tarih >= bugunBaslangic) g += sure;
+        if (tarih >= haftaBaslangic) h += sure;
+        if (tarih >= ayBaslangic) {
+          a += sure;
+          kisiAy[m.ad] = (kisiAy[m.ad] || 0) + sure;
+        }
+      });
+      setSaatGun(Math.round(g * 100) / 100);
+      setSaatHafta(Math.round(h * 100) / 100);
+      setSaatAy(Math.round(a * 100) / 100);
+      setPersonelAySaat(Object.entries(kisiAy).map(([ad, saat]) => ({ ad, saat: Math.round(saat * 100) / 100 })).sort((x, y) => y.saat - x.saat));
     })();
   }, []);
 
@@ -88,6 +126,26 @@ function GenelBakis() {
         <div className="stat-card"><div className="label">Şu an içeride</div><div className="value">{icerdekiler} kişi</div></div>
         <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
       </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2 className="section">Çalışma Saatleri (tüm personel toplamı)</h2>
+        <div className="grid cols-3" style={{ marginTop: 10 }}>
+          <div className="stat-card"><div className="label">Bugün</div><div className="value">{sureFormatla(saatGun)}</div></div>
+          <div className="stat-card"><div className="label">Bu hafta</div><div className="value">{sureFormatla(saatHafta)}</div></div>
+          <div className="stat-card"><div className="label">Bu ay</div><div className="value">{sureFormatla(saatAy)}</div></div>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 10 }}>Süreler, her mesaideki 1 saatlik mola düşülerek hesaplanmıştır.</div>
+        <table style={{ marginTop: 8 }}>
+          <thead><tr><th>Personel</th><th>Bu ay toplam</th></tr></thead>
+          <tbody>
+            {personelAySaat.map((p) => (
+              <tr key={p.ad}><td>{p.ad}</td><td>{sureFormatla(p.saat)}</td></tr>
+            ))}
+            {personelAySaat.length === 0 && <tr><td colSpan={2}>Bu ay tamamlanmış mesai kaydı yok.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
       <div className="card" style={{ marginTop: 16 }}>
         <h2 className="section">Lokasyon bazlı maliyet</h2>
         <table>
@@ -168,37 +226,110 @@ function Lokasyonlar() {
 
 /* ---------------- ARAÇLAR ---------------- */
 function Araclar() {
+  const [araclar, setAraclar] = useState([]);
   const [kayitlar, setKayitlar] = useState([]);
+  const [seciliPlaka, setSeciliPlaka] = useState(null);
 
   useEffect(() => {
+    supabase.from('araclar').select('*').then(({ data }) => setAraclar(data || []));
     supabase.from('arac_kullanim').select('*').order('tarih', { ascending: false }).then(({ data }) => setKayitlar(data || []));
   }, []);
 
-  const toplamKm = kayitlar.reduce((a, k) => a + (Number(k.katedilen_km) || 0), 0);
+  const gosterilenKayitlar = seciliPlaka ? kayitlar.filter((k) => k.plaka === seciliPlaka) : kayitlar;
+  const toplamKm = gosterilenKayitlar.reduce((a, k) => a + (Number(k.katedilen_km) || 0), 0);
+
+  function sureMetni(baslangic, bitis) {
+    if (!baslangic || !bitis) return '—';
+    const dakika = Math.round((new Date(bitis) - new Date(baslangic)) / 60000);
+    if (dakika < 60) return dakika + ' dk';
+    return Math.floor(dakika / 60) + ' sa ' + (dakika % 60) + ' dk';
+  }
+
+  function kartaTiklandi(e, plaka) {
+    e.stopPropagation();
+    setSeciliPlaka((mevcut) => (mevcut === plaka ? null : plaka));
+  }
 
   return (
-    <div className="card">
-      <div className="grid cols-2">
-        <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
-        <div className="stat-card"><div className="label">Tahmini araç maliyeti</div><div className="value">{(toplamKm * KM_BIRIM_MALIYET).toLocaleString('tr-TR')} TL</div></div>
+    <div onClick={() => setSeciliPlaka(null)}>
+      <div className="card">
+        <h2 className="section">Araç Filosu</h2>
+        {seciliPlaka && (
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 6 }}>
+            <b style={{ color: 'var(--ink)' }}>{seciliPlaka}</b> filtreleniyor — seçimi kaldırmak için boş bir yere tıklayın.
+          </div>
+        )}
+        <div className="grid cols-3" style={{ marginTop: 10 }}>
+          {araclar.map((a) => {
+            const secili = seciliPlaka === a.plaka;
+            return (
+              <div
+                key={a.plaka}
+                className="card"
+                onClick={(e) => kartaTiklandi(e, a.plaka)}
+                style={{
+                  padding: 12, marginBottom: 0, cursor: 'pointer',
+                  border: secili ? '2px solid var(--accent-patron)' : '1px solid var(--border)',
+                  transition: 'border-color 0.15s',
+                }}
+              >
+                <div style={{
+                  width: '100%', height: 110, borderRadius: 8, background: '#F0F2EE',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', marginBottom: 10,
+                }}>
+                  {a.resim_url
+                    ? <img src={a.resim_url} alt={a.plaka} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    : <span style={{ fontSize: 32 }}>🚐</span>}
+                </div>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{[a.marka, a.model].filter(Boolean).join(' ') || 'Marka/model girilmedi'}</div>
+                <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 2 }}>{a.plaka}</div>
+                <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span className={'status-tag' + (a.durum === 'Boşta' ? ' open' : '')}>{a.durum}</span>
+                  <span style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{(a.son_km || 0).toLocaleString('tr-TR')} km</span>
+                  {secili && <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-patron)' }}>✓ Seçili</span>}
+                </div>
+              </div>
+            );
+          })}
+          {araclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz araç eklenmedi.</div>}
+        </div>
       </div>
-      <h2 className="section" style={{ marginTop: 18 }}>Araç kullanım geçmişi</h2>
-      <table>
-        <thead><tr><th>Tarih</th><th>Personel</th><th>Plaka</th><th>Alış km</th><th>Teslim km</th><th>Kat edilen</th><th>Durum</th></tr></thead>
-        <tbody>
-          {kayitlar.map((k) => (
-            <tr key={k.id}>
-              <td>{new Date(k.tarih).toLocaleDateString('tr-TR')}</td>
-              <td>{k.ad}</td>
-              <td>{k.plaka}</td>
-              <td>{Number(k.alis_km).toLocaleString('tr-TR')}</td>
-              <td>{k.teslim_km ? Number(k.teslim_km).toLocaleString('tr-TR') : '—'}</td>
-              <td>{k.katedilen_km ? Number(k.katedilen_km).toLocaleString('tr-TR') + ' km' : '—'}</td>
-              <td><span className={'status-tag' + (k.durum === 'Açık' ? ' open' : '')}>{k.durum}</span></td>
+
+      <div className="card" onClick={(e) => e.stopPropagation()}>
+        <div className="grid cols-2">
+          <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
+          <div className="stat-card"><div className="label">Tahmini araç maliyeti</div><div className="value">{(toplamKm * KM_BIRIM_MALIYET).toLocaleString('tr-TR')} TL</div></div>
+        </div>
+        <h2 className="section" style={{ marginTop: 18 }}>
+          {seciliPlaka ? seciliPlaka + ' — kullanım geçmişi' : 'Araç kullanım geçmişi (tüm araçlar)'}
+        </h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Tarih</th><th>Personel</th><th>Plaka</th>
+              <th>Alış saati</th><th>Alış km</th>
+              <th>Teslim saati</th><th>Teslim km</th>
+              <th>Süre</th><th>Kat edilen</th><th>Durum</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {gosterilenKayitlar.map((k) => (
+              <tr key={k.id}>
+                <td>{new Date(k.tarih).toLocaleDateString('tr-TR')}</td>
+                <td>{k.ad}</td>
+                <td>{k.plaka}</td>
+                <td>{new Date(k.tarih).toLocaleTimeString('tr-TR')}</td>
+                <td>{Number(k.alis_km).toLocaleString('tr-TR')}</td>
+                <td>{k.teslim_saati ? new Date(k.teslim_saati).toLocaleTimeString('tr-TR') : '—'}</td>
+                <td>{k.teslim_km ? Number(k.teslim_km).toLocaleString('tr-TR') : '—'}</td>
+                <td>{sureMetni(k.tarih, k.teslim_saati)}</td>
+                <td>{k.katedilen_km ? Number(k.katedilen_km).toLocaleString('tr-TR') + ' km' : '—'}</td>
+                <td><span className={'status-tag' + (k.durum === 'Açık' ? ' open' : '')}>{k.durum}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -427,6 +558,11 @@ function Ayarlar() {
   const [yeniLokasyon, setYeniLokasyon] = useState('');
   const [yeniKalem, setYeniKalem] = useState('');
   const [yeniPlaka, setYeniPlaka] = useState('');
+  const [yeniPlakaKm, setYeniPlakaKm] = useState('');
+  const [yeniMarka, setYeniMarka] = useState('');
+  const [yeniModel, setYeniModel] = useState('');
+  const [yeniResimDosya, setYeniResimDosya] = useState(null);
+  const [ekleniyor, setEkleniyor] = useState(false);
   const [ypNo, setYpNo] = useState('');
   const [ypSifre, setYpSifre] = useState('');
   const [ypAd, setYpAd] = useState('');
@@ -457,8 +593,40 @@ function Ayarlar() {
   }
   async function plakaEkle() {
     if (!yeniPlaka.trim()) return;
-    await supabase.from('araclar').insert({ plaka: yeniPlaka.trim(), durum: 'Boşta' });
-    setYeniPlaka('');
+    setEkleniyor(true);
+
+    let resimUrl = null;
+    if (yeniResimDosya) {
+      const dosyaAdi = Date.now() + '-' + yeniResimDosya.name.replace(/\s+/g, '-');
+      const { error: yuklemeHatasi } = await supabase.storage.from('arac-resimleri').upload(dosyaAdi, yeniResimDosya);
+      if (yuklemeHatasi) {
+        alert('Resim yüklenemedi: ' + yuklemeHatasi.message);
+        setEkleniyor(false);
+        return;
+      }
+      const { data: urlData } = supabase.storage.from('arac-resimleri').getPublicUrl(dosyaAdi);
+      resimUrl = urlData.publicUrl;
+    }
+
+    await supabase.from('araclar').insert({
+      plaka: yeniPlaka.trim(),
+      durum: 'Boşta',
+      son_km: Number(yeniPlakaKm) || 0,
+      marka: yeniMarka.trim() || null,
+      model: yeniModel.trim() || null,
+      resim_url: resimUrl,
+    });
+    setYeniPlaka(''); setYeniPlakaKm(''); setYeniMarka(''); setYeniModel(''); setYeniResimDosya(null);
+    setEkleniyor(false);
+    hepsiniYukle();
+  }
+  async function plakaSil(plaka, durum) {
+    if (durum === 'Kullanımda') {
+      alert('Bu araç şu an kullanımda, önce personel tarafından teslim edilmesi gerekiyor.');
+      return;
+    }
+    if (!confirm(plaka + ' plakalı aracı silmek istediğine emin misin?')) return;
+    await supabase.from('araclar').delete().eq('plaka', plaka);
     hepsiniYukle();
   }
   async function personelEkle() {
@@ -491,11 +659,35 @@ function Ayarlar() {
         </div>
       </div>
       <div className="card">
-        <h2 className="section">Araçlar</h2>
-        <div className="tag-list">{araclar.map((a) => <span key={a.plaka} className="tag-pill">{a.plaka} · {a.durum}</span>)}</div>
-        <div className="add-row">
-          <input placeholder="Yeni plaka (örn. 34 AB 123)" value={yeniPlaka} onChange={(e) => setYeniPlaka(e.target.value)} />
-          <button onClick={plakaEkle}>Ekle</button>
+        <h2 className="section">Araç Filosu</h2>
+        <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+          {araclar.map((a) => (
+            <div key={a.plaka} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              <div style={{ fontSize: 13 }}>
+                <b>{a.plaka}</b> · {[a.marka, a.model].filter(Boolean).join(' ') || 'marka/model yok'} · {a.durum} · {(a.son_km || 0).toLocaleString('tr-TR')} km
+              </div>
+              <button
+                onClick={() => plakaSil(a.plaka, a.durum)}
+                style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+              >
+                Sil
+              </button>
+            </div>
+          ))}
+          {araclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz araç eklenmedi.</div>}
+        </div>
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+          <input placeholder="Plaka (örn. 34 AB 123)" value={yeniPlaka} onChange={(e) => setYeniPlaka(e.target.value)} />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input placeholder="Marka (örn. Ford)" value={yeniMarka} onChange={(e) => setYeniMarka(e.target.value)} />
+            <input placeholder="Model (örn. Transit)" value={yeniModel} onChange={(e) => setYeniModel(e.target.value)} />
+          </div>
+          <input placeholder="Başlangıç km" type="number" value={yeniPlakaKm} onChange={(e) => setYeniPlakaKm(e.target.value)} />
+          <label style={{ margin: '2px 0 0' }}>Araç fotoğrafı (opsiyonel)</label>
+          <input type="file" accept="image/*" onChange={(e) => setYeniResimDosya(e.target.files?.[0] || null)} />
+          <button onClick={plakaEkle} disabled={ekleniyor} style={{ border: 'none', background: 'var(--accent-patron)', color: '#fff', borderRadius: 9, padding: '10px 0', fontWeight: 700, cursor: 'pointer' }}>
+            {ekleniyor ? 'Ekleniyor...' : 'Aracı Ekle'}
+          </button>
         </div>
       </div>
       <div className="card">

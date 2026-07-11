@@ -1,14 +1,26 @@
-// Bu dosya, personel panelinizdeki (app/personel/page.js) TÜM İÇERİĞİN yerine
-// geçecek güncellenmiş halidir. Kopyalayıp dosyanın tamamının üzerine yapıştırın.
+// Bu dosya, personel panelinizdeki (örn. app/personel/page.js) TÜM İÇERİĞİN
+// yerine geçecek güncellenmiş halidir. Aşağıdaki 4 parça birbirine bağlı
+// çalıştığı için hepsini birlikte, olduğu gibi kopyalayın.
 //
-// ÖNEMLİ: Bu dosyayı kullanmadan önce Supabase'de sırasıyla şu SQL dosyalarını
-// çalıştırmayı unutmayın: migration-lokasyon-ekle.sql, migration-projeler.sql
+// ÖNEMLİ: Bu dosyayı kullanmadan önce Supabase'de migration-lokasyon-ekle.sql
+// (giris_cikis'e lokasyon sütunu) VE migration-son-km.sql (araclar'a son_km
+// sütunu) dosyalarının ikisinin de çalıştırılmış olması gerekiyor.
 
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
+
+// Ondalık saat değerini (örn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne çevirir.
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
 
 export default function PersonelPanel() {
   const router = useRouter();
@@ -53,9 +65,9 @@ export default function PersonelPanel() {
       </div>
       <div className="tabbar">
         <button className={tab === 'mesai' ? 'active-personel' : ''} onClick={() => setTab('mesai')}>Mesai</button>
+        <button className={tab === 'saatler' ? 'active-personel' : ''} onClick={() => setTab('saatler')}>Çalışma Saatlerim</button>
         <button className={tab === 'arac' ? 'active-personel' : ''} onClick={() => setTab('arac')}>Araç</button>
-        <button className={tab === 'veri' ? 'active-personel' : ''} onClick={() => setTab('veri')}>Gider</button>
-        <button className={tab === 'projeler' ? 'active-personel' : ''} onClick={() => setTab('projeler')}>Projelerim</button>
+        <button className={tab === 'veri' ? 'active-personel' : ''} onClick={() => setTab('veri')}>Saha Verisi</button>
       </div>
       <div className="content">
         {tab === 'mesai' && (
@@ -66,9 +78,9 @@ export default function PersonelPanel() {
             lokasyonAyarlandi={setAktifLokasyon}
           />
         )}
+        {tab === 'saatler' && <SaatlerimTab oturum={oturum} />}
         {tab === 'arac' && <AracTab oturum={oturum} />}
         {tab === 'veri' && <VeriTab oturum={oturum} aktifLokasyon={aktifLokasyon} />}
-        {tab === 'projeler' && <ProjelerimTab oturum={oturum} aktifLokasyon={aktifLokasyon} />}
       </div>
     </div>
   );
@@ -91,6 +103,7 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
 
   async function durumYukle() {
     setYukleniyor(true);
+    // En son giriş kaydını al (açık ya da kapalı) — bugünkü/son bilinen lokasyonu bilmek için
     const { data } = await supabase
       .from('giris_cikis')
       .select('*')
@@ -127,13 +140,14 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
     setMesaj(null);
     const now = new Date();
     const girisSaati = new Date(acikKayit.giris_saati);
-    const sureSaat = Math.round(((now - girisSaati) / 3600000) * 100) / 100;
+    const hamSure = (now - girisSaati) / 3600000;
+    const sureSaat = Math.round(Math.max(hamSure - 1, 0) * 100) / 100; // 1 saatlik mola otomatik düşülür
     const { error } = await supabase
       .from('giris_cikis')
       .update({ cikis_saati: now.toISOString(), sure_saat: sureSaat, durum: 'Kapalı' })
       .eq('id', acikKayit.id);
     if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
-    setMesaj({ tip: 'ok', metin: 'Çıkış kaydedildi. Süre: ' + sureSaat + ' saat' });
+    setMesaj({ tip: 'ok', metin: 'Çıkış kaydedildi. Süre: ' + sureFormatla(sureSaat) + ' (1 saatlik mola düşüldü)' });
     durumYukle();
   }
 
@@ -180,10 +194,85 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
   );
 }
 
-/* ---------------- ARAÇ ---------------- */
+/* ---------------- ÇALIŞMA SAATLERİM (gün/hafta/ay, 1 saat mola dahil) ---------------- */
+function SaatlerimTab({ oturum }) {
+  const [yukleniyor, setYukleniyor] = useState(true);
+  const [bugun, setBugun] = useState(0);
+  const [haftalik, setHaftalik] = useState(0);
+  const [aylik, setAylik] = useState(0);
+  const [gecmis, setGecmis] = useState([]);
+
+  useEffect(() => {
+    (async () => {
+      setYukleniyor(true);
+      const { data } = await supabase
+        .from('giris_cikis')
+        .select('*')
+        .eq('personel_no', oturum.personel_no)
+        .eq('durum', 'Kapalı')
+        .order('giris_saati', { ascending: false });
+
+      const kayitlar = data || [];
+      const now = new Date();
+      const bugunBaslangic = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const haftaBaslangic = new Date(now);
+      haftaBaslangic.setDate(now.getDate() - 7);
+      const ayBaslangic = new Date(now.getFullYear(), now.getMonth(), 1);
+
+      let g = 0, h = 0, a = 0;
+      kayitlar.forEach((k) => {
+        const tarih = new Date(k.giris_saati);
+        const sure = Number(k.sure_saat) || 0;
+        if (tarih >= bugunBaslangic) g += sure;
+        if (tarih >= haftaBaslangic) h += sure;
+        if (tarih >= ayBaslangic) a += sure;
+      });
+
+      setBugun(Math.round(g * 100) / 100);
+      setHaftalik(Math.round(h * 100) / 100);
+      setAylik(Math.round(a * 100) / 100);
+      setGecmis(kayitlar.slice(0, 15));
+      setYukleniyor(false);
+    })();
+  }, [oturum.personel_no]);
+
+  if (yukleniyor) return <div className="loading-text">Yükleniyor...</div>;
+
+  return (
+    <>
+      <div className="grid cols-3">
+        <div className="stat-card"><div className="label">Bugün</div><div className="value">{sureFormatla(bugun)}</div></div>
+        <div className="stat-card"><div className="label">Bu hafta</div><div className="value">{sureFormatla(haftalik)}</div></div>
+        <div className="stat-card"><div className="label">Bu ay</div><div className="value">{sureFormatla(aylik)}</div></div>
+      </div>
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2 className="section">Son mesai kayıtları</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginBottom: 8 }}>Süreler, her mesaideki 1 saatlik mola düşülerek hesaplanmıştır.</div>
+        <table>
+          <thead><tr><th>Tarih</th><th>Giriş</th><th>Çıkış</th><th>Süre</th></tr></thead>
+          <tbody>
+            {gecmis.map((k) => (
+              <tr key={k.id}>
+                <td>{new Date(k.giris_saati).toLocaleDateString('tr-TR')}</td>
+                <td>{new Date(k.giris_saati).toLocaleTimeString('tr-TR')}</td>
+                <td>{k.cikis_saati ? new Date(k.cikis_saati).toLocaleTimeString('tr-TR') : '—'}</td>
+                <td>{k.sure_saat ? sureFormatla(k.sure_saat) : '—'}</td>
+              </tr>
+            ))}
+            {gecmis.length === 0 && <tr><td colSpan={4}>Henüz tamamlanmış mesai kaydın yok.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+/* ---------------- ARAÇ (km kilitli + gecmis kullanim listesi) ---------------- */
 function AracTab({ oturum }) {
   const [acikKayit, setAcikKayit] = useState(null);
   const [bostaAraclar, setBostaAraclar] = useState([]);
+  const [tumAraclar, setTumAraclar] = useState([]);
+  const [gecmis, setGecmis] = useState([]);
   const [plaka, setPlaka] = useState('');
   const [alisKm, setAlisKm] = useState('');
   const [teslimKm, setTeslimKm] = useState('');
@@ -203,16 +292,38 @@ function AracTab({ oturum }) {
     if (!acik) {
       const { data: bosta } = await supabase.from('araclar').select('*').eq('durum', 'Boşta');
       setBostaAraclar(bosta || []);
-      if (bosta && bosta.length) setPlaka(bosta[0].plaka);
+      if (bosta && bosta.length) {
+        setPlaka(bosta[0].plaka);
+        setAlisKm(bosta[0].son_km != null ? String(bosta[0].son_km) : '');
+      }
     }
+
+    const { data: hepsi } = await supabase.from('araclar').select('*');
+    setTumAraclar(hepsi || []);
+
+    const { data: gecmisVeri } = await supabase
+      .from('arac_kullanim')
+      .select('*')
+      .eq('personel_no', oturum.personel_no)
+      .eq('durum', 'Kapalı')
+      .order('tarih', { ascending: false })
+      .limit(10);
+    setGecmis(gecmisVeri || []);
+
     setYukleniyor(false);
   }
 
   useEffect(() => { veriYukle(); }, []); // eslint-disable-line
 
+  function plakaDegisti(yeniPlaka) {
+    setPlaka(yeniPlaka);
+    const arac = bostaAraclar.find((a) => a.plaka === yeniPlaka);
+    setAlisKm(arac && arac.son_km != null ? String(arac.son_km) : '');
+  }
+
   async function teslimAl() {
     setMesaj(null);
-    if (!plaka || !alisKm) { setMesaj({ tip: 'err', metin: 'Plaka ve alış kilometresi gerekli.' }); return; }
+    if (!plaka || alisKm === '') { setMesaj({ tip: 'err', metin: 'Plaka ve alış kilometresi gerekli.' }); return; }
     const { error: e1 } = await supabase.from('arac_kullanim').insert({
       personel_no: oturum.personel_no, ad: oturum.ad, plaka, alis_km: Number(alisKm), durum: 'Açık',
     });
@@ -230,10 +341,10 @@ function AracTab({ oturum }) {
     const katedilen = t - acikKayit.alis_km;
     const { error: e1 } = await supabase
       .from('arac_kullanim')
-      .update({ teslim_km: t, katedilen_km: katedilen, durum: 'Kapalı' })
+      .update({ teslim_km: t, katedilen_km: katedilen, durum: 'Kapalı', teslim_saati: new Date().toISOString() })
       .eq('id', acikKayit.id);
     if (e1) { setMesaj({ tip: 'err', metin: e1.message }); return; }
-    await supabase.from('araclar').update({ durum: 'Boşta' }).eq('plaka', acikKayit.plaka);
+    await supabase.from('araclar').update({ durum: 'Boşta', son_km: t }).eq('plaka', acikKayit.plaka);
     setMesaj({ tip: 'ok', metin: 'Araç teslim edildi. Kat edilen: ' + katedilen.toLocaleString('tr-TR') + ' km' });
     setTeslimKm('');
     veriYukle();
@@ -241,41 +352,118 @@ function AracTab({ oturum }) {
 
   if (yukleniyor) return <div className="loading-text">Yükleniyor...</div>;
 
-  if (acikKayit) {
-    const fark = teslimKm ? Number(teslimKm) - acikKayit.alis_km : null;
-    return (
-      <div className="card">
-        <h2 className="section">Araç Teslim Et</h2>
-        <div className="loc-badge">
-          <div><div className="label">Kullanımdaki araç</div><div className="value">{acikKayit.plaka}</div></div>
-          <div><div className="label">Alış km</div><div className="value">{acikKayit.alis_km.toLocaleString('tr-TR')}</div></div>
-        </div>
-        <label>Teslim kilometresi</label>
-        <input type="number" value={teslimKm} onChange={(e) => setTeslimKm(e.target.value)} placeholder="örn. 84350" />
-        {fark > 0 && <div className="km-diff">{fark.toLocaleString('tr-TR')} km</div>}
-        <button className="action btn-punch cikis" onClick={teslimEt}>Aracı Teslim Et</button>
-        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
-      </div>
-    );
-  }
+  const secilenArac = bostaAraclar.find((a) => a.plaka === plaka);
 
   return (
-    <div className="card">
-      <h2 className="section">Araç Teslim Al</h2>
-      <label>Plaka seç</label>
-      <select value={plaka} onChange={(e) => setPlaka(e.target.value)}>
-        {bostaAraclar.length === 0 && <option value="">Boşta araç yok</option>}
-        {bostaAraclar.map((a) => <option key={a.plaka} value={a.plaka}>{a.plaka}</option>)}
-      </select>
-      <label>Alış kilometresi</label>
-      <input type="number" value={alisKm} onChange={(e) => setAlisKm(e.target.value)} placeholder="örn. 84210" />
-      <button className="action btn-punch" onClick={teslimAl} disabled={!bostaAraclar.length}>Aracı Teslim Al</button>
-      {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
-    </div>
+    <>
+      <div className="card">
+        <h2 className="section">Araç Filosu</h2>
+        <div className="grid cols-3" style={{ marginTop: 10 }}>
+          {tumAraclar.map((a) => {
+            const secilebilir = !acikKayit && a.durum === 'Boşta';
+            const secili = secilebilir && plaka === a.plaka;
+            return (
+              <div
+                key={a.plaka}
+                className="card"
+                onClick={secilebilir ? () => plakaDegisti(a.plaka) : undefined}
+                style={{
+                  padding: 12,
+                  marginBottom: 0,
+                  cursor: secilebilir ? 'pointer' : 'default',
+                  opacity: secilebilir || acikKayit ? 1 : 0.55,
+                  border: secili ? '2px solid var(--accent-personel)' : '1px solid var(--border)',
+                  transition: 'border-color 0.15s',
+                }}
+              >
+                <div style={{
+                  width: '100%', height: 90, borderRadius: 8, background: '#F0F2EE',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', marginBottom: 8,
+                }}>
+                  {a.resim_url
+                    ? <img src={a.resim_url} alt={a.plaka} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    : <span style={{ fontSize: 28 }}>🚐</span>}
+                </div>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{[a.marka, a.model].filter(Boolean).join(' ') || 'Marka/model girilmedi'}</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{a.plaka}</div>
+                <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span className={'status-tag' + (a.durum === 'Boşta' ? ' open' : '')}>{a.durum}</span>
+                  {secili && <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-personel)' }}>✓ Seçili</span>}
+                </div>
+              </div>
+            );
+          })}
+          {tumAraclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz araç eklenmedi.</div>}
+        </div>
+      </div>
+
+      {acikKayit ? (
+        <div className="card">
+          <h2 className="section">Araç Teslim Et</h2>
+          <div className="loc-badge">
+            <div><div className="label">Kullanımdaki araç</div><div className="value">{acikKayit.plaka}</div></div>
+            <div><div className="label">Alış km</div><div className="value">{acikKayit.alis_km.toLocaleString('tr-TR')}</div></div>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 8 }}>
+            Alış saati: {new Date(acikKayit.tarih).toLocaleTimeString('tr-TR')}
+          </div>
+          <label>Teslim kilometresi</label>
+          <input type="number" value={teslimKm} onChange={(e) => setTeslimKm(e.target.value)} placeholder="örn. 84350" />
+          {teslimKm && Number(teslimKm) - acikKayit.alis_km > 0 && (
+            <div className="km-diff">{(Number(teslimKm) - acikKayit.alis_km).toLocaleString('tr-TR')} km</div>
+          )}
+          <button className="action btn-punch cikis" onClick={teslimEt}>Aracı Teslim Et</button>
+          {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+        </div>
+      ) : (
+        <div className="card">
+          <h2 className="section">Araç Teslim Al</h2>
+          <label>Plaka seç</label>
+          <select value={plaka} onChange={(e) => plakaDegisti(e.target.value)}>
+            {bostaAraclar.length === 0 && <option value="">Boşta araç yok</option>}
+            {bostaAraclar.map((a) => (
+              <option key={a.plaka} value={a.plaka}>
+                {a.plaka}{(a.marka || a.model) ? ' · ' + [a.marka, a.model].filter(Boolean).join(' ') : ''}
+              </option>
+            ))}
+          </select>
+          <label>Alış kilometresi</label>
+          <input type="number" value={alisKm} readOnly disabled style={{ background: '#F0F2EE', color: 'var(--ink-soft)' }} />
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>
+            Aracın son bilinen kilometresi — değiştirilemez.
+          </div>
+          <button className="action btn-punch" onClick={teslimAl} disabled={!bostaAraclar.length}>Aracı Teslim Al</button>
+          {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+        </div>
+      )}
+
+      <div className="card">
+        <h2 className="section">Geçmiş Araç Kullanımlarım</h2>
+        {gecmis.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz tamamlanmış araç kullanımın yok.</div>}
+        {gecmis.length > 0 && (
+          <table>
+            <thead><tr><th>Tarih</th><th>Plaka</th><th>Alış saati</th><th>Alış km</th><th>Teslim saati</th><th>Teslim km</th><th>Kat edilen</th></tr></thead>
+            <tbody>
+              {gecmis.map((g) => (
+                <tr key={g.id}>
+                  <td>{new Date(g.tarih).toLocaleDateString('tr-TR')}</td>
+                  <td>{g.plaka}</td>
+                  <td>{new Date(g.tarih).toLocaleTimeString('tr-TR')}</td>
+                  <td>{Number(g.alis_km).toLocaleString('tr-TR')}</td>
+                  <td>{g.teslim_saati ? new Date(g.teslim_saati).toLocaleTimeString('tr-TR') : '—'}</td>
+                  <td>{g.teslim_km ? Number(g.teslim_km).toLocaleString('tr-TR') : '—'}</td>
+                  <td>{g.katedilen_km ? Number(g.katedilen_km).toLocaleString('tr-TR') + ' km' : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
   );
 }
 
-/* ---------------- GİDER (eski adıyla Saha Verisi) ---------------- */
+/* ---------------- SAHA VERİSİ ---------------- */
 function VeriTab({ oturum, aktifLokasyon }) {
   const [kalemTurleri, setKalemTurleri] = useState([]);
   const [kalemTuru, setKalemTuru] = useState('');
@@ -391,7 +579,7 @@ function VeriTab({ oturum, aktifLokasyon }) {
 
   return (
     <div className="card">
-      <h2 className="section">GİDER</h2>
+      <h2 className="section">Saha Verisi Ekle</h2>
 
       {aktifLokasyon ? (
         <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 6 }}>
@@ -437,119 +625,6 @@ function VeriTab({ oturum, aktifLokasyon }) {
       <input value={aciklama} onChange={(e) => setAciklama(e.target.value)} placeholder="kısa not" />
       <button className="action btn-secondary" onClick={() => kaydet()} disabled={!aktifLokasyon}>Kaydet</button>
       {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
-    </div>
-  );
-}
-
-/* ---------------- PROJELERİM ---------------- */
-function ProjelerimTab({ oturum, aktifLokasyon }) {
-  const [projeler, setProjeler] = useState([]);
-  const [seciliProje, setSeciliProje] = useState(null);
-  const [notlar, setNotlar] = useState([]);
-  const [acikPin, setAcikPin] = useState(null);
-  const [mesaj, setMesaj] = useState(null);
-
-  useEffect(() => {
-    if (!aktifLokasyon) { setProjeler([]); return; }
-    supabase
-      .from('projeler')
-      .select('*')
-      .eq('lokasyon', aktifLokasyon)
-      .order('created_at', { ascending: false })
-      .then(({ data }) => setProjeler(data || []));
-  }, [aktifLokasyon]);
-
-  async function notlariYukle(projeId) {
-    const { data } = await supabase.from('proje_notlari').select('*').eq('proje_id', projeId).order('created_at', { ascending: true });
-    setNotlar(data || []);
-  }
-
-  async function projeSec(p) {
-    setSeciliProje(p);
-    setAcikPin(null);
-    await notlariYukle(p.id);
-  }
-
-  async function duzelttim(pin) {
-    setMesaj(null);
-    const { error } = await supabase
-      .from('proje_notlari')
-      .update({ durum: 'Çözüldü', cozen: oturum.ad, cozuldu_at: new Date().toISOString() })
-      .eq('id', pin.id);
-    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
-    setAcikPin(null);
-    notlariYukle(seciliProje.id);
-  }
-
-  if (!aktifLokasyon) {
-    return (
-      <div className="card">
-        <h2 className="section">Projelerim</h2>
-        <div className="feedback err" style={{ marginTop: 6 }}>
-          Önce "Mesai" sekmesinden giriş yapıp bugünkü lokasyonunuzu seçin.
-        </div>
-      </div>
-    );
-  }
-
-  if (seciliProje) {
-    return (
-      <div className="card">
-        <style>{`
-          @keyframes pinNabiz { 0% { box-shadow: 0 0 0 0 rgba(220,38,38,0.5); } 70% { box-shadow: 0 0 0 12px rgba(220,38,38,0); } 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0); } }
-          .proje-pin { position: absolute; width: 22px; height: 22px; border-radius: 50%; transform: translate(-50%, -50%); cursor: pointer; border: 2px solid white; }
-          .proje-pin.acik { background: #dc2626; animation: pinNabiz 1.6s infinite; }
-          .proje-pin.cozuldu { background: #16a34a; }
-        `}</style>
-        <button className="action btn-secondary" style={{ marginBottom: 12 }} onClick={() => setSeciliProje(null)}>← Projelere dön</button>
-        <h2 className="section">{seciliProje.baslik}</h2>
-        <div style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
-          <img src={seciliProje.resim_url} alt={seciliProje.baslik} style={{ maxWidth: '100%', display: 'block', borderRadius: 8 }} />
-          {notlar.map((n) => (
-            <div
-              key={n.id}
-              className={'proje-pin ' + (n.durum === 'Açık' ? 'acik' : 'cozuldu')}
-              style={{ left: n.x + '%', top: n.y + '%' }}
-              onClick={() => setAcikPin(n)}
-            />
-          ))}
-        </div>
-
-        {acikPin && (
-          <div className="card" style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 13, marginBottom: 8 }}>
-              <span className={'status-tag' + (acikPin.durum === 'Açık' ? ' open' : '')}>{acikPin.durum}</span>
-            </div>
-            <div style={{ marginBottom: 10 }}>{acikPin.aciklama}</div>
-            {acikPin.durum === 'Açık' ? (
-              <button className="action btn-ai" onClick={() => duzelttim(acikPin)}>Düzelttim</button>
-            ) : (
-              <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{acikPin.cozen} tarafından düzeltildi.</div>
-            )}
-            <button className="action btn-secondary" style={{ marginTop: 8 }} onClick={() => setAcikPin(null)}>Kapat</button>
-          </div>
-        )}
-        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
-      </div>
-    );
-  }
-
-  return (
-    <div className="card">
-      <h2 className="section">Projelerim</h2>
-      {projeler.length === 0 && (
-        <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 8 }}>
-          Bu lokasyonda henüz proje eklenmemiş.
-        </div>
-      )}
-      <div style={{ display: 'grid', gap: 10, marginTop: 10 }}>
-        {projeler.map((p) => (
-          <div key={p.id} className="card" style={{ cursor: 'pointer', padding: 10 }} onClick={() => projeSec(p)}>
-            <img src={p.resim_url} alt={p.baslik} style={{ width: '100%', height: 120, objectFit: 'cover', borderRadius: 6 }} />
-            <div style={{ marginTop: 6, fontWeight: 600 }}>{p.baslik}</div>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }
