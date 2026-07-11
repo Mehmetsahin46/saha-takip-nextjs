@@ -1,10 +1,34 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
+import { getInitialTheme, temaUygula, temaDegistir } from '@/lib/theme';
+import * as XLSX from 'xlsx';
+import jsPDF from 'jspdf';
 
 const KM_BIRIM_MALIYET = 5; // TL / km, tahmini yakıt + aşınma
+
+function excelIndir(veriler, dosyaAdi) {
+  const ws = XLSX.utils.json_to_sheet(veriler);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Veri');
+  XLSX.writeFile(wb, dosyaAdi);
+}
+
+function teklifPdfIndir(teklif) {
+  const doc = new jsPDF();
+  doc.setFontSize(16);
+  doc.text('Teklif', 14, 18);
+  doc.setFontSize(11);
+  doc.text('Lokasyon: ' + teklif.lokasyon, 14, 28);
+  doc.text('Tarih: ' + new Date(teklif.tarih).toLocaleString('tr-TR'), 14, 34);
+  doc.text('Toplam Maliyet: ' + Number(teklif.toplam_maliyet).toLocaleString('tr-TR') + ' TL', 14, 40);
+  const satirlar = doc.splitTextToSize(teklif.teklif_metni, 180);
+  doc.text(satirlar, 14, 50);
+  doc.save('teklif-' + teklif.lokasyon.replace(/\s+/g, '-') + '.pdf');
+}
 
 // Ondalık saat değerini (örn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne çevirir.
 function sureFormatla(saatOndalik) {
@@ -20,6 +44,7 @@ export default function PatronPanel() {
   const router = useRouter();
   const [oturum, setOturum] = useState(null);
   const [tab, setTab] = useState('genel');
+  const [tema, setTema] = useState('light');
 
   useEffect(() => {
     const kayit = localStorage.getItem('aktifOturum');
@@ -28,6 +53,12 @@ export default function PatronPanel() {
     if (parsed.rol !== 'patron') { router.push('/'); return; }
     setOturum(parsed);
   }, [router]);
+
+  useEffect(() => {
+    const t = getInitialTheme();
+    setTema(t);
+    temaUygula(t);
+  }, []);
 
   function cikisYapOturum() {
     localStorage.removeItem('aktifOturum');
@@ -41,7 +72,10 @@ export default function PatronPanel() {
       <div className="app-header">
         <span className="brand">Saha Takip</span>
         <span className="who">Yönetim Paneli — <b>Patron</b></span>
-        <button className="logout" onClick={cikisYapOturum}>Çıkış</button>
+        <div>
+          <button className="theme-toggle" onClick={() => setTema(temaDegistir(tema))}>{tema === 'dark' ? '☀️' : '🌙'}</button>
+          <button className="logout" onClick={cikisYapOturum}>Çıkış</button>
+        </div>
       </div>
       <div className="tabbar">
         <button className={tab === 'genel' ? 'active-patron' : ''} onClick={() => setTab('genel')}>Genel Bakış</button>
@@ -148,6 +182,19 @@ function GenelBakis() {
 
       <div className="card" style={{ marginTop: 16 }}>
         <h2 className="section">Lokasyon bazlı maliyet</h2>
+        {lokasyonOzet.length > 0 && (
+          <div style={{ width: '100%', height: 220, marginTop: 12 }}>
+            <ResponsiveContainer>
+              <BarChart data={lokasyonOzet}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <XAxis dataKey="lokasyon" tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} />
+                <YAxis tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} />
+                <Tooltip formatter={(v) => v.toLocaleString('tr-TR') + ' TL'} contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', fontSize: 12 }} />
+                <Bar dataKey="toplam" fill="var(--accent-patron)" radius={[6, 6, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
         <table>
           <thead><tr><th>Lokasyon</th><th>Kalem</th><th>Toplam</th></tr></thead>
           <tbody>
@@ -207,6 +254,17 @@ function Lokasyonlar() {
       </select>
       <div className="summary-total">{toplam.toLocaleString('tr-TR')} TL</div>
       <div className="summary-sub">{kalemler.length} kalem girildi</div>
+      <button
+        className="action btn-secondary"
+        style={{ marginTop: 10 }}
+        disabled={!kalemler.length}
+        onClick={() => excelIndir(
+          kalemler.map((k) => ({ Kalem: k.kalem_turu, Personel: k.ad, Miktar: k.miktar, 'Birim Fiyat': k.birim_fiyat, Toplam: k.toplam, Açıklama: k.aciklama || '' })),
+          secili.replace(/\s+/g, '-') + '-maliyet.xlsx'
+        )}
+      >
+        📊 Excel'e Aktar
+      </button>
       <table>
         <thead><tr><th>Kalem</th><th>Miktar</th><th>Birim</th><th>Toplam</th></tr></thead>
         <tbody>
@@ -229,13 +287,20 @@ function Araclar() {
   const [araclar, setAraclar] = useState([]);
   const [kayitlar, setKayitlar] = useState([]);
   const [seciliPlaka, setSeciliPlaka] = useState(null);
+  const [baslangicTarih, setBaslangicTarih] = useState('');
+  const [bitisTarih, setBitisTarih] = useState('');
+  const [personelArama, setPersonelArama] = useState('');
 
   useEffect(() => {
     supabase.from('araclar').select('*').then(({ data }) => setAraclar(data || []));
     supabase.from('arac_kullanim').select('*').order('tarih', { ascending: false }).then(({ data }) => setKayitlar(data || []));
   }, []);
 
-  const gosterilenKayitlar = seciliPlaka ? kayitlar.filter((k) => k.plaka === seciliPlaka) : kayitlar;
+  let gosterilenKayitlar = seciliPlaka ? kayitlar.filter((k) => k.plaka === seciliPlaka) : kayitlar;
+  if (baslangicTarih) gosterilenKayitlar = gosterilenKayitlar.filter((k) => new Date(k.tarih) >= new Date(baslangicTarih));
+  if (bitisTarih) gosterilenKayitlar = gosterilenKayitlar.filter((k) => new Date(k.tarih) <= new Date(bitisTarih + 'T23:59:59'));
+  if (personelArama.trim()) gosterilenKayitlar = gosterilenKayitlar.filter((k) => k.ad.toLocaleLowerCase('tr-TR').includes(personelArama.trim().toLocaleLowerCase('tr-TR')));
+
   const toplamKm = gosterilenKayitlar.reduce((a, k) => a + (Number(k.katedilen_km) || 0), 0);
 
   function sureMetni(baslangic, bitis) {
@@ -303,6 +368,35 @@ function Araclar() {
         <h2 className="section" style={{ marginTop: 18 }}>
           {seciliPlaka ? seciliPlaka + ' — kullanım geçmişi' : 'Araç kullanım geçmişi (tüm araçlar)'}
         </h2>
+        <div className="grid cols-3" style={{ marginTop: 8 }}>
+          <div>
+            <label>Başlangıç tarihi</label>
+            <input type="date" value={baslangicTarih} onChange={(e) => setBaslangicTarih(e.target.value)} />
+          </div>
+          <div>
+            <label>Bitiş tarihi</label>
+            <input type="date" value={bitisTarih} onChange={(e) => setBitisTarih(e.target.value)} />
+          </div>
+          <div>
+            <label>Personel ara</label>
+            <input placeholder="isim yazın" value={personelArama} onChange={(e) => setPersonelArama(e.target.value)} />
+          </div>
+        </div>
+        <button
+          className="action btn-secondary"
+          disabled={!gosterilenKayitlar.length}
+          onClick={() => excelIndir(
+            gosterilenKayitlar.map((k) => ({
+              Tarih: new Date(k.tarih).toLocaleDateString('tr-TR'), Personel: k.ad, Plaka: k.plaka,
+              'Alış Saati': new Date(k.tarih).toLocaleTimeString('tr-TR'), 'Alış Km': k.alis_km,
+              'Teslim Saati': k.teslim_saati ? new Date(k.teslim_saati).toLocaleTimeString('tr-TR') : '',
+              'Teslim Km': k.teslim_km || '', 'Kat Edilen Km': k.katedilen_km || '', Durum: k.durum,
+            })),
+            'arac-kullanim-gecmisi.xlsx'
+          )}
+        >
+          📊 Excel'e Aktar
+        </button>
         <table>
           <thead>
             <tr>
@@ -531,19 +625,44 @@ function ProjelerTab() {
 /* ---------------- TEKLİFLER ---------------- */
 function Teklifler() {
   const [teklifler, setTeklifler] = useState([]);
+  const [arama, setArama] = useState('');
 
   useEffect(() => {
     supabase.from('teklifler').select('*').order('tarih', { ascending: false }).then(({ data }) => setTeklifler(data || []));
   }, []);
 
+  const gosterilenler = arama.trim()
+    ? teklifler.filter((t) => t.lokasyon.toLocaleLowerCase('tr-TR').includes(arama.trim().toLocaleLowerCase('tr-TR')))
+    : teklifler;
+
   return (
     <div className="card">
       <h2 className="section">Geçmiş Teklifler</h2>
-      {teklifler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz teklif oluşturulmadı.</div>}
-      {teklifler.map((t) => (
-        <div key={t.id} style={{ borderBottom: '1px solid var(--border)', padding: '10px 0', fontSize: 13 }}>
-          {new Date(t.tarih).toLocaleString('tr-TR')} · {t.lokasyon} · {Number(t.toplam_maliyet).toLocaleString('tr-TR')} TL{' '}
-          <span className="status-tag">{t.durum}</span>
+      <label>Lokasyona göre ara</label>
+      <input placeholder="lokasyon adı yazın" value={arama} onChange={(e) => setArama(e.target.value)} />
+      <button
+        className="action btn-secondary"
+        disabled={!gosterilenler.length}
+        onClick={() => excelIndir(
+          gosterilenler.map((t) => ({ Tarih: new Date(t.tarih).toLocaleString('tr-TR'), Lokasyon: t.lokasyon, 'Toplam Maliyet': t.toplam_maliyet, Durum: t.durum })),
+          'teklifler.xlsx'
+        )}
+      >
+        📊 Excel'e Aktar
+      </button>
+      {gosterilenler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13, marginTop: 10 }}>Gösterilecek teklif yok.</div>}
+      {gosterilenler.map((t) => (
+        <div key={t.id} style={{ borderBottom: '1px solid var(--border)', padding: '10px 0', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+          <span>
+            {new Date(t.tarih).toLocaleString('tr-TR')} · {t.lokasyon} · {Number(t.toplam_maliyet).toLocaleString('tr-TR')} TL{' '}
+            <span className="status-tag">{t.durum}</span>
+          </span>
+          <button
+            onClick={() => teklifPdfIndir(t)}
+            style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+          >
+            📄 PDF İndir
+          </button>
         </div>
       ))}
     </div>
@@ -677,7 +796,7 @@ function Ayarlar() {
           {araclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz araç eklenmedi.</div>}
         </div>
         <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
-          <input placeholder="Plaka (örn. 34 AB 123)" value={yeniPlaka} onChange={(e) => setYeniPlaka(e.target.value)} />
+          <input placeholder="Plaka (örn. 34 AB 123)" value={yeniPlaka} onChange={(e) => setYeniPlaka(e.target.value.toLocaleUpperCase('tr-TR'))} style={{ textTransform: 'uppercase' }} />
           <div style={{ display: 'flex', gap: 8 }}>
             <input placeholder="Marka (örn. Ford)" value={yeniMarka} onChange={(e) => setYeniMarka(e.target.value)} />
             <input placeholder="Model (örn. Transit)" value={yeniModel} onChange={(e) => setYeniModel(e.target.value)} />

@@ -90,3 +90,30 @@ th { color: var(--ink-soft); font-weight: 600; text-transform: uppercase; font-s
 .add-row input { flex: 1; }
 .add-row button { border: none; background: var(--accent-patron); color: #fff; border-radius: 9px; padding: 0 16px; font-weight: 700; cursor: pointer; }
 .loading-text { text-align: center; color: var(--ink-soft); font-size: 14px; padding: 8px 0; }
+
+/* ---------------- KARANLIK MOD ---------------- */
+[data-theme="dark"] {
+  --bg: #14181A;
+  --card: #1E2427;
+  --ink: #ECEFEA;
+  --ink-soft: #93A098;
+  --border: #2E3538;
+  --accent-patron-soft: #223038;
+}
+[data-theme="dark"] .chip { background: #262D30; }
+[data-theme="dark"] .loc-badge { background: #2A2118; }
+[data-theme="dark"] .tag-pill { background: #262D30; }
+[data-theme="dark"] input, [data-theme="dark"] select { background: #171B1D; color: var(--ink); }
+[data-theme="dark"] .status-tag { background: #332A19; }
+[data-theme="dark"] .status-tag.open { background: #16261D; }
+[data-theme="dark"] .feedback.ok { background: #16261D; }
+[data-theme="dark"] .feedback.err { background: #2E1B14; }
+.theme-toggle {
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 7px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 14px;
+  margin-right: 8px;
+}

@@ -11,6 +11,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
+import { getInitialTheme, temaUygula, temaDegistir } from '@/lib/theme';
 
 // Ondalık saat değerini (örn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne çevirir.
 function sureFormatla(saatOndalik) {
@@ -29,6 +30,7 @@ export default function PersonelPanel() {
   const [saat, setSaat] = useState('');
   const [tarihMetni, setTarihMetni] = useState('');
   const [aktifLokasyon, setAktifLokasyon] = useState(null); // o günkü seçilen lokasyon
+  const [tema, setTema] = useState('light');
 
   useEffect(() => {
     const kayit = localStorage.getItem('aktifOturum');
@@ -37,6 +39,12 @@ export default function PersonelPanel() {
     if (parsed.rol !== 'personel') { router.push('/'); return; }
     setOturum(parsed);
   }, [router]);
+
+  useEffect(() => {
+    const t = getInitialTheme();
+    setTema(t);
+    temaUygula(t);
+  }, []);
 
   useEffect(() => {
     const tick = () => {
@@ -61,7 +69,10 @@ export default function PersonelPanel() {
       <div className="app-header">
         <span className="brand">Saha Takip</span>
         <span className="who">Merhaba, <b>{oturum.ad}</b></span>
-        <button className="logout" onClick={cikisYapOturum}>Çıkış</button>
+        <div>
+          <button className="theme-toggle" onClick={() => setTema(temaDegistir(tema))}>{tema === 'dark' ? '☀️' : '🌙'}</button>
+          <button className="logout" onClick={cikisYapOturum}>Çıkış</button>
+        </div>
       </div>
       <div className="tabbar">
         <button className={tab === 'mesai' ? 'active-personel' : ''} onClick={() => setTab('mesai')}>Mesai</button>
