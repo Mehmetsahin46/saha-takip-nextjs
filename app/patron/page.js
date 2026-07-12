@@ -5,8 +5,10 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { getInitialTheme, temaUygula, temaDegistir } from '@/lib/theme';
+import { konumAl } from '@/lib/geo';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
+import QRCode from 'qrcode';
 
 const KM_BIRIM_MALIYET = 5; // TL / km, tahmini yakıt + aşınma
 
@@ -81,6 +83,7 @@ export default function PatronPanel() {
         <button className={tab === 'genel' ? 'active-patron' : ''} onClick={() => setTab('genel')}>Genel Bakış</button>
         <button className={tab === 'lokasyonlar' ? 'active-patron' : ''} onClick={() => setTab('lokasyonlar')}>Lokasyonlar</button>
         <button className={tab === 'araclar' ? 'active-patron' : ''} onClick={() => setTab('araclar')}>Araç Filosu</button>
+        <button className={tab === 'gorevler' ? 'active-patron' : ''} onClick={() => setTab('gorevler')}>Görevler</button>
         <button className={tab === 'projeler' ? 'active-patron' : ''} onClick={() => setTab('projeler')}>Projeler</button>
         <button className={tab === 'teklifler' ? 'active-patron' : ''} onClick={() => setTab('teklifler')}>Teklifler</button>
         <button className={tab === 'ayarlar' ? 'active-patron' : ''} onClick={() => setTab('ayarlar')}>Ayarlar</button>
@@ -89,6 +92,7 @@ export default function PatronPanel() {
         {tab === 'genel' && <GenelBakis />}
         {tab === 'lokasyonlar' && <Lokasyonlar />}
         {tab === 'araclar' && <Araclar />}
+        {tab === 'gorevler' && <GorevlerTab />}
         {tab === 'projeler' && <ProjelerTab />}
         {tab === 'teklifler' && <Teklifler />}
         {tab === 'ayarlar' && <Ayarlar />}
@@ -428,6 +432,146 @@ function Araclar() {
   );
 }
 
+/* ---------------- GÖREVLER ---------------- */
+function GorevlerTab() {
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [personeller, setPersoneller] = useState([]);
+  const [gorevler, setGorevler] = useState([]);
+  const [durumFiltre, setDurumFiltre] = useState('Tümü');
+
+  const [yLokasyon, setYLokasyon] = useState('');
+  const [yBaslik, setYBaslik] = useState('');
+  const [yAciklama, setYAciklama] = useState('');
+  const [yOncelik, setYOncelik] = useState('Normal');
+  const [ySonTarih, setYSonTarih] = useState('');
+  const [ySeciliPersonel, setYSeciliPersonel] = useState([]);
+  const [mesaj, setMesaj] = useState(null);
+  const [ekleniyor, setEkleniyor] = useState(false);
+
+  async function hepsiniYukle() {
+    const { data: l } = await supabase.from('lokasyonlar').select('*');
+    const { data: p } = await supabase.from('personel').select('*').neq('rol', 'patron');
+    const { data: g } = await supabase.from('gorevler').select('*').order('olusturulma_tarihi', { ascending: false });
+    setLokasyonlar(l || []);
+    setPersoneller(p || []);
+    setGorevler(g || []);
+    if (l && l.length && !yLokasyon) setYLokasyon(l[0].ad);
+  }
+
+  useEffect(() => { hepsiniYukle(); }, []); // eslint-disable-line
+
+  function personelSecimiDegistir(no) {
+    setYSeciliPersonel((mevcut) => (mevcut.includes(no) ? mevcut.filter((x) => x !== no) : [...mevcut, no]));
+  }
+
+  async function gorevOlustur() {
+    setMesaj(null);
+    if (!yBaslik.trim() || !yLokasyon) { setMesaj({ tip: 'err', metin: 'Başlık ve lokasyon gerekli.' }); return; }
+    if (!ySeciliPersonel.length) { setMesaj({ tip: 'err', metin: 'En az bir personel seçin.' }); return; }
+    setEkleniyor(true);
+    const adlar = ySeciliPersonel.map((no) => personeller.find((p) => p.personel_no === no)?.ad || no);
+    const { error } = await supabase.from('gorevler').insert({
+      lokasyon: yLokasyon, baslik: yBaslik.trim(), aciklama: yAciklama.trim() || null,
+      oncelik: yOncelik, son_tarih: ySonTarih || null,
+      atanan_personel_no: ySeciliPersonel, atanan_adlar: adlar, durum: 'Bekliyor',
+    });
+    setEkleniyor(false);
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+    setMesaj({ tip: 'ok', metin: 'Görev oluşturuldu.' });
+    setYBaslik(''); setYAciklama(''); setYOncelik('Normal'); setYSonTarih(''); setYSeciliPersonel([]);
+    hepsiniYukle();
+  }
+
+  async function durumDegistir(gorev, yeniDurum) {
+    await supabase.from('gorevler').update({
+      durum: yeniDurum,
+      tamamlanma_tarihi: yeniDurum === 'Tamamlandı' ? new Date().toISOString() : null,
+    }).eq('id', gorev.id);
+    hepsiniYukle();
+  }
+
+  async function gorevSil(id) {
+    if (!confirm('Bu görevi silmek istediğine emin misin?')) return;
+    await supabase.from('gorevler').delete().eq('id', id);
+    hepsiniYukle();
+  }
+
+  const gosterilenGorevler = durumFiltre === 'Tümü' ? gorevler : gorevler.filter((g) => g.durum === durumFiltre);
+  const oncelikRengi = { 'Düşük': '#5B6560', 'Normal': '#2B4C5C', 'Yüksek': '#A0592A', 'Acil': '#B23B0E' };
+
+  return (
+    <div className="grid cols-2">
+      <div className="card">
+        <h2 className="section">Yeni Görev Oluştur</h2>
+        <label>Lokasyon</label>
+        <select value={yLokasyon} onChange={(e) => setYLokasyon(e.target.value)}>
+          {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
+        </select>
+        <label>Başlık</label>
+        <input value={yBaslik} onChange={(e) => setYBaslik(e.target.value)} placeholder="örn. Zemin betonu dökümü" />
+        <label>Açıklama</label>
+        <input value={yAciklama} onChange={(e) => setYAciklama(e.target.value)} placeholder="detaylar (opsiyonel)" />
+        <label>Öncelik</label>
+        <select value={yOncelik} onChange={(e) => setYOncelik(e.target.value)}>
+          <option>Düşük</option><option>Normal</option><option>Yüksek</option><option>Acil</option>
+        </select>
+        <label>Son tarih</label>
+        <input type="date" value={ySonTarih} onChange={(e) => setYSonTarih(e.target.value)} />
+        <label>Atanacak personel</label>
+        <div className="tag-list">
+          {personeller.map((p) => (
+            <span
+              key={p.personel_no}
+              className={'chip' + (ySeciliPersonel.includes(p.personel_no) ? ' sel' : '')}
+              onClick={() => personelSecimiDegistir(p.personel_no)}
+            >
+              {p.ad}
+            </span>
+          ))}
+          {personeller.length === 0 && <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>Henüz personel yok.</span>}
+        </div>
+        <button className="action btn-ai" onClick={gorevOlustur} disabled={ekleniyor}>
+          {ekleniyor ? 'Oluşturuluyor...' : 'Görevi Oluştur'}
+        </button>
+        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+      </div>
+
+      <div className="card">
+        <h2 className="section">Görevler</h2>
+        <label>Durum filtrele</label>
+        <select value={durumFiltre} onChange={(e) => setDurumFiltre(e.target.value)}>
+          <option>Tümü</option><option>Bekliyor</option><option>Devam Ediyor</option><option>Tamamlandı</option>
+        </select>
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+          {gosterilenGorevler.map((g) => (
+            <div key={g.id} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 8 }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{g.baslik}</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{g.lokasyon} · {(g.atanan_adlar || []).join(', ')}</div>
+                  {g.aciklama && <div style={{ fontSize: 13, marginTop: 6 }}>{g.aciklama}</div>}
+                  <div style={{ fontSize: 11, marginTop: 6, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 700, color: oncelikRengi[g.oncelik] || 'var(--ink-soft)' }}>{g.oncelik}</span>
+                    {g.son_tarih && <span style={{ color: 'var(--ink-soft)' }}>Son tarih: {new Date(g.son_tarih).toLocaleDateString('tr-TR')}</span>}
+                    <span className={'status-tag' + (g.durum === 'Tamamlandı' ? ' open' : '')}>{g.durum}</span>
+                  </div>
+                </div>
+                <button onClick={() => gorevSil(g.id)} style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '4px 8px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
+              </div>
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                {g.durum !== 'Bekliyor' && <button onClick={() => durumDegistir(g, 'Bekliyor')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'var(--card)', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Bekliyor yap</button>}
+                {g.durum !== 'Devam Ediyor' && <button onClick={() => durumDegistir(g, 'Devam Ediyor')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'var(--card)', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Devam Ediyor yap</button>}
+                {g.durum !== 'Tamamlandı' && <button onClick={() => durumDegistir(g, 'Tamamlandı')} style={{ fontSize: 11, border: '1px solid var(--border)', background: '#E4F3EA', color: '#2F8F5B', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Tamamlandı yap</button>}
+              </div>
+            </div>
+          ))}
+          {gosterilenGorevler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Gösterilecek görev yok.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------- PROJELER (mimar planları + hata işaretleme) ---------------- */
 function ProjelerTab() {
   const [lokasyonlar, setLokasyonlar] = useState([]);
@@ -675,6 +819,12 @@ function Ayarlar() {
   const [kalemTurleri, setKalemTurleri] = useState([]);
   const [araclar, setAraclar] = useState([]);
   const [yeniLokasyon, setYeniLokasyon] = useState('');
+  const [yeniEnlem, setYeniEnlem] = useState('');
+  const [yeniBoylam, setYeniBoylam] = useState('');
+  const [yeniYaricap, setYeniYaricap] = useState('150');
+  const [konumAliniyor, setKonumAliniyor] = useState(false);
+  const [gorunenQr, setGorunenQr] = useState(null); // { ad, dataUrl }
+  const [ayarlar, setAyarlar] = useState({ konum_dogrulama_aktif: false, qr_dogrulama_aktif: false, gunluk_rapor_aktif: false, haftalik_rapor_aktif: false, aylik_rapor_aktif: false, rapor_eposta: '' });
   const [yeniKalem, setYeniKalem] = useState('');
   const [yeniPlaka, setYeniPlaka] = useState('');
   const [yeniPlakaKm, setYeniPlakaKm] = useState('');
@@ -685,29 +835,114 @@ function Ayarlar() {
   const [ypNo, setYpNo] = useState('');
   const [ypSifre, setYpSifre] = useState('');
   const [ypAd, setYpAd] = useState('');
+  const [ypRol, setYpRol] = useState('personel');
   const [ypMesaj, setYpMesaj] = useState(null);
+  const [tumPersonel, setTumPersonel] = useState([]);
+  const [testGonderiliyor, setTestGonderiliyor] = useState(false);
+  const [testMesaj, setTestMesaj] = useState(null);
+  const [duzenlenenKalemId, setDuzenlenenKalemId] = useState(null);
+  const [duzenlenenKalemAd, setDuzenlenenKalemAd] = useState('');
 
   async function hepsiniYukle() {
     const { data: l } = await supabase.from('lokasyonlar').select('*');
     const { data: k } = await supabase.from('kalem_turleri').select('*');
     const { data: a } = await supabase.from('araclar').select('*');
+    const { data: s } = await supabase.from('sistem_ayarlari').select('*').eq('id', 1).maybeSingle();
+    const { data: p } = await supabase.from('personel').select('*').neq('rol', 'patron').order('ad');
     setLokasyonlar(l || []);
     setKalemTurleri(k || []);
     setAraclar(a || []);
+    if (s) setAyarlar(s);
+    setTumPersonel(p || []);
   }
 
   useEffect(() => { hepsiniYukle(); }, []);
 
+  async function ayarGuncelle(alan, deger) {
+    const yeniAyarlar = { ...ayarlar, [alan]: deger };
+    setAyarlar(yeniAyarlar);
+    await supabase.from('sistem_ayarlari').update({ [alan]: deger }).eq('id', 1);
+  }
+
+  async function testEpostasiGonder() {
+    if (!ayarlar.rapor_eposta || !ayarlar.rapor_eposta.trim()) {
+      setTestMesaj({ tip: 'err', metin: 'Lütfen geçerli bir e-posta adresi girin.' });
+      return;
+    }
+    setTestGonderiliyor(true);
+    setTestMesaj(null);
+    try {
+      const res = await fetch('/api/cron/test-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eposta: ayarlar.rapor_eposta.trim() }),
+      });
+      const data = await res.json();
+      if (data.basari) {
+        setTestMesaj({ tip: 'ok', metin: data.mesaj || 'Test e-postası başarıyla gönderildi!' });
+      } else {
+        setTestMesaj({ tip: 'err', metin: data.mesaj || 'Gönderim başarısız.' });
+      }
+    } catch (err) {
+      setTestMesaj({ tip: 'err', metin: 'İstek hatası: ' + err.message });
+    }
+    setTestGonderiliyor(false);
+  }
+
+  async function suankiKonumuKullan() {
+    setKonumAliniyor(true);
+    try {
+      const { lat, lon } = await konumAl();
+      setYeniEnlem(String(lat));
+      setYeniBoylam(String(lon));
+    } catch (err) {
+      alert(err.message);
+    }
+    setKonumAliniyor(false);
+  }
+
   async function lokasyonEkle() {
     if (!yeniLokasyon.trim()) return;
-    await supabase.from('lokasyonlar').insert({ ad: yeniLokasyon.trim() });
-    setYeniLokasyon('');
+    const qrKodu = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random();
+    await supabase.from('lokasyonlar').insert({
+      ad: yeniLokasyon.trim(),
+      enlem: yeniEnlem ? Number(yeniEnlem) : null,
+      boylam: yeniBoylam ? Number(yeniBoylam) : null,
+      yaricap_metre: Number(yeniYaricap) || 150,
+      qr_kodu: qrKodu,
+    });
+    setYeniLokasyon(''); setYeniEnlem(''); setYeniBoylam(''); setYeniYaricap('150');
     hepsiniYukle();
   }
+
+  async function lokasyonSil(ad) {
+    if (!confirm(ad + ' lokasyonunu silmek istediğine emin misin?')) return;
+    await supabase.from('lokasyonlar').delete().eq('ad', ad);
+    hepsiniYukle();
+  }
+
+  async function qrGoster(lokasyon) {
+    if (!lokasyon.qr_kodu) { alert('Bu lokasyon için QR kod tanımlı değil.'); return; }
+    const dataUrl = await QRCode.toDataURL(lokasyon.qr_kodu, { width: 260 });
+    setGorunenQr({ ad: lokasyon.ad, dataUrl });
+  }
+
   async function kalemEkle() {
     if (!yeniKalem.trim()) return;
     await supabase.from('kalem_turleri').insert({ ad: yeniKalem.trim() });
     setYeniKalem('');
+    hepsiniYukle();
+  }
+  async function kalemSil(id, ad) {
+    if (!confirm(ad + ' kalem türünü silmek istediğine emin misin?')) return;
+    await supabase.from('kalem_turleri').delete().eq('id', id);
+    hepsiniYukle();
+  }
+  async function kalemGuncelle(id) {
+    if (!duzenlenenKalemAd.trim()) return;
+    await supabase.from('kalem_turleri').update({ ad: duzenlenenKalemAd.trim() }).eq('id', id);
+    setDuzenlenenKalemId(null);
+    setDuzenlenenKalemAd('');
     hepsiniYukle();
   }
   async function plakaEkle() {
@@ -752,26 +987,219 @@ function Ayarlar() {
     setYpMesaj(null);
     if (!ypNo.trim() || !ypSifre.trim() || !ypAd.trim()) { setYpMesaj({ tip: 'err', metin: 'Tüm alanları doldurun.' }); return; }
     const { error } = await supabase.from('personel').insert({
-      personel_no: ypNo.trim(), sifre: ypSifre.trim(), ad: ypAd.trim(), rol: 'personel',
+      personel_no: ypNo.trim(), sifre: ypSifre.trim(), ad: ypAd.trim(), rol: ypRol,
     });
     if (error) { setYpMesaj({ tip: 'err', metin: error.message }); return; }
-    setYpMesaj({ tip: 'ok', metin: ypAd + ' eklendi (' + ypNo + '). Lokasyonunu her gün kendisi giriş yaparken seçecek.' });
-    setYpNo(''); setYpSifre(''); setYpAd('');
+    setYpMesaj({ tip: 'ok', metin: ypAd + ' eklendi (' + ypNo + ', ' + (ypRol === 'ustabasi' ? 'Ustabaşı' : 'Personel') + ').' });
+    setYpNo(''); setYpSifre(''); setYpAd(''); setYpRol('personel');
+    hepsiniYukle();
+  }
+
+  async function rolDegistir(personel_no, yeniRol) {
+    await supabase.from('personel').update({ rol: yeniRol }).eq('personel_no', personel_no);
+    hepsiniYukle();
+  }
+
+  async function personelSil(personel_no, ad) {
+    if (!confirm(ad + ' adlı personeli silmek istediğine emin misin? Geçmiş kayıtları (mesai, masraf vb.) etkilenmez.')) return;
+    await supabase.from('personel').delete().eq('personel_no', personel_no);
+    hepsiniYukle();
   }
 
   return (
     <div className="grid cols-2">
       <div className="card">
+        <h2 className="section">Doğrulama Ayarları</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 12 }}>
+          Açarsan, personel mesai giriş/çıkışında bu doğrulamaları geçmek zorunda kalır.
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 14 }}>📍 Konum doğrulaması</span>
+          <button
+            onClick={() => ayarGuncelle('konum_dogrulama_aktif', !ayarlar.konum_dogrulama_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.konum_dogrulama_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.konum_dogrulama_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.konum_dogrulama_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0' }}>
+          <span style={{ fontSize: 14 }}>📷 QR kod doğrulaması</span>
+          <button
+            onClick={() => ayarGuncelle('qr_dogrulama_aktif', !ayarlar.qr_dogrulama_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.qr_dogrulama_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.qr_dogrulama_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.qr_dogrulama_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2 className="section">E-Posta Raporları</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 12 }}>
+          Günlük ve aylık özet raporlarının gönderileceği e-posta adresini ve durumunu ayarlayın.
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 13, fontWeight: 'bold' }}>Rapor Gönderilecek E-posta</label>
+          <input
+            type="email"
+            placeholder="ornek@firma.com"
+            value={ayarlar.rapor_eposta || ''}
+            onChange={(e) => setAyarlar({ ...ayarlar, rapor_eposta: e.target.value })}
+            onBlur={(e) => ayarGuncelle('rapor_eposta', e.target.value.trim())}
+            style={{ marginTop: 6 }}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button
+              onClick={testEpostasiGonder}
+              disabled={testGonderiliyor || !ayarlar.rapor_eposta}
+              className="action btn-secondary"
+              style={{ width: 'auto', fontSize: 12, padding: '6px 12px', height: 'auto', cursor: 'pointer' }}
+            >
+              {testGonderiliyor ? 'Gönderiliyor...' : '⚡ Test E-postası Gönder'}
+            </button>
+          </div>
+          {testMesaj && <div className={`feedback ${testMesaj.tip}`} style={{ marginTop: 8, fontSize: 12 }}>{testMesaj.metin}</div>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 14 }}>✉️ Günlük E-posta Raporu</span>
+          <button
+            onClick={() => ayarGuncelle('gunluk_rapor_aktif', !ayarlar.gunluk_rapor_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.gunluk_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.gunluk_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.gunluk_rapor_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 14 }}>📅 Haftalık E-posta Raporu</span>
+          <button
+            onClick={() => ayarGuncelle('haftalik_rapor_aktif', !ayarlar.haftalik_rapor_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.haftalik_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.haftalik_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.haftalik_rapor_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0' }}>
+          <span style={{ fontSize: 14 }}>📅 Aylık E-posta Raporu</span>
+          <button
+            onClick={() => ayarGuncelle('aylik_rapor_aktif', !ayarlar.aylik_rapor_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.aylik_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.aylik_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.aylik_rapor_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
         <h2 className="section">Lokasyonlar</h2>
-        <div className="tag-list">{lokasyonlar.map((l) => <span key={l.ad} className="tag-pill">{l.ad}</span>)}</div>
-        <div className="add-row">
+        <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+          {lokasyonlar.map((l) => (
+            <div key={l.ad} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ fontSize: 13 }}>
+                  <b>{l.ad}</b> {l.enlem != null ? ' · 📍 konum tanımlı' : ' · konum yok'} · yarıçap {l.yaricap_metre || 150} m
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={() => qrGoster(l)} style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>QR</button>
+                  <button onClick={() => lokasyonSil(l.ad)} style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
+                </div>
+              </div>
+            </div>
+          ))}
+          {lokasyonlar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz lokasyon eklenmedi.</div>}
+        </div>
+
+        {gorunenQr && (
+          <div className="card" style={{ marginTop: 12, textAlign: 'center' }}>
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>{gorunenQr.ad}</div>
+            <img src={gorunenQr.dataUrl} alt="QR kod" style={{ width: 180, height: 180, margin: '0 auto' }} />
+            <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'center' }}>
+              <a href={gorunenQr.dataUrl} download={gorunenQr.ad + '-qr.png'} className="action btn-secondary" style={{ width: 'auto', padding: '8px 14px', textDecoration: 'none' }}>İndir</a>
+              <button className="action btn-secondary" style={{ width: 'auto', padding: '8px 14px' }} onClick={() => setGorunenQr(null)}>Kapat</button>
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: 'grid', gap: 8, marginTop: 14 }}>
           <input placeholder="Yeni lokasyon adı" value={yeniLokasyon} onChange={(e) => setYeniLokasyon(e.target.value)} />
-          <button onClick={lokasyonEkle}>Ekle</button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input placeholder="Enlem (opsiyonel)" value={yeniEnlem} onChange={(e) => setYeniEnlem(e.target.value)} />
+            <input placeholder="Boylam (opsiyonel)" value={yeniBoylam} onChange={(e) => setYeniBoylam(e.target.value)} />
+          </div>
+          <button onClick={suankiKonumuKullan} disabled={konumAliniyor} style={{ border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', borderRadius: 9, padding: '9px 0', fontWeight: 600, cursor: 'pointer', fontSize: 13 }}>
+            {konumAliniyor ? 'Konum alınıyor...' : '📍 Şu Anki Konumu Kullan (sahadayken)'}
+          </button>
+          <input placeholder="İzin verilen yarıçap (metre)" type="number" value={yeniYaricap} onChange={(e) => setYeniYaricap(e.target.value)} />
+          <button onClick={lokasyonEkle} style={{ border: 'none', background: 'var(--accent-patron)', color: '#fff', borderRadius: 9, padding: '10px 0', fontWeight: 700, cursor: 'pointer' }}>Lokasyon Ekle</button>
         </div>
       </div>
       <div className="card">
         <h2 className="section">Kalem Türleri</h2>
-        <div className="tag-list">{kalemTurleri.map((k) => <span key={k.ad} className="tag-pill">{k.ad}</span>)}</div>
+        <div style={{ display: 'grid', gap: 8, marginTop: 10, marginBottom: 12 }}>
+          {kalemTurleri.map((k) => (
+            <div key={k.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              {duzenlenenKalemId === k.id ? (
+                <div style={{ display: 'flex', gap: 6, width: '100%' }}>
+                  <input
+                    value={duzenlenenKalemAd}
+                    onChange={(e) => setDuzenlenenKalemAd(e.target.value)}
+                    style={{ padding: '5px 8px', fontSize: 13, flex: 1 }}
+                  />
+                  <button
+                    onClick={() => kalemGuncelle(k.id)}
+                    style={{ border: 'none', background: '#E4F3EA', color: '#2F8F5B', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    Kaydet
+                  </button>
+                  <button
+                    onClick={() => { setDuzenlenenKalemId(null); setDuzenlenenKalemAd(''); }}
+                    style={{ border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    İptal
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>{k.ad}</span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={() => { setDuzenlenenKalemId(k.id); setDuzenlenenKalemAd(k.ad); }}
+                      style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                    >
+                      Düzenle
+                    </button>
+                    <button
+                      onClick={() => kalemSil(k.id, k.ad)}
+                      style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                    >
+                      Sil
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          ))}
+          {kalemTurleri.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz kalem türü eklenmedi.</div>}
+        </div>
         <div className="add-row">
           <input placeholder="Yeni kalem türü" value={yeniKalem} onChange={(e) => setYeniKalem(e.target.value)} />
           <button onClick={kalemEkle}>Ekle</button>
@@ -810,12 +1238,50 @@ function Ayarlar() {
         </div>
       </div>
       <div className="card">
-        <h2 className="section">Yeni Personel</h2>
+        <h2 className="section">Personel Yönetimi</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 10 }}>
+          Sadece <b>Ustabaşı</b> rolündeki kişiler Saha Verisi (masraf) girebilir. Personel rolü bu ekrana erişemez.
+        </div>
+        <div style={{ display: 'grid', gap: 8 }}>
+          {tumPersonel.map((p) => (
+            <div key={p.personel_no} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ fontSize: 13 }}>
+                  <b>{p.ad}</b> · {p.personel_no}
+                </div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <select
+                    value={p.rol}
+                    onChange={(e) => rolDegistir(p.personel_no, e.target.value)}
+                    style={{ padding: '5px 8px', fontSize: 12, width: 'auto' }}
+                  >
+                    <option value="personel">Personel</option>
+                    <option value="ustabasi">Ustabaşı</option>
+                  </select>
+                  <button
+                    onClick={() => personelSil(p.personel_no, p.ad)}
+                    style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    Sil
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+          {tumPersonel.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz personel eklenmedi.</div>}
+        </div>
+
+        <h2 className="section" style={{ marginTop: 18 }}>Yeni Personel Ekle</h2>
         <label>Personel no</label><input value={ypNo} onChange={(e) => setYpNo(e.target.value)} placeholder="1004" />
         <label>Şifre</label><input value={ypSifre} onChange={(e) => setYpSifre(e.target.value)} placeholder="1234" />
         <label>Ad Soyad</label><input value={ypAd} onChange={(e) => setYpAd(e.target.value)} placeholder="Ad Soyad" />
+        <label>Rol</label>
+        <select value={ypRol} onChange={(e) => setYpRol(e.target.value)}>
+          <option value="personel">Personel</option>
+          <option value="ustabasi">Ustabaşı</option>
+        </select>
         <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>
-          Lokasyon burada seçilmiyor — işçi ilk mesai girişinde kendi lokasyonunu seçecek.
+          Lokasyon burada seçilmiyor — kişi ilk mesai girişinde kendi lokasyonunu seçecek.
         </div>
         <button className="action btn-ai" onClick={personelEkle}>Personel Ekle</button>
         {ypMesaj && <div className={'feedback ' + ypMesaj.tip}>{ypMesaj.metin}</div>}

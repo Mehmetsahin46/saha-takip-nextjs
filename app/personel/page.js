@@ -12,6 +12,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { getInitialTheme, temaUygula, temaDegistir } from '@/lib/theme';
+import { konumAl, mesafeMetre } from '@/lib/geo';
+import QrOkuyucu from '@/components/QrOkuyucu';
 
 // Ondalık saat değerini (örn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne çevirir.
 function sureFormatla(saatOndalik) {
@@ -36,7 +38,7 @@ export default function PersonelPanel() {
     const kayit = localStorage.getItem('aktifOturum');
     if (!kayit) { router.push('/'); return; }
     const parsed = JSON.parse(kayit);
-    if (parsed.rol !== 'personel') { router.push('/'); return; }
+    if (parsed.rol !== 'personel' && parsed.rol !== 'ustabasi') { router.push('/'); return; }
     setOturum(parsed);
   }, [router]);
 
@@ -68,7 +70,7 @@ export default function PersonelPanel() {
     <div>
       <div className="app-header">
         <span className="brand">Saha Takip</span>
-        <span className="who">Merhaba, <b>{oturum.ad}</b></span>
+        <span className="who">Merhaba, <b>{oturum.ad}</b> {oturum.rol === 'ustabasi' && '(Ustabaşı)'}</span>
         <div>
           <button className="theme-toggle" onClick={() => setTema(temaDegistir(tema))}>{tema === 'dark' ? '☀️' : '🌙'}</button>
           <button className="logout" onClick={cikisYapOturum}>Çıkış</button>
@@ -77,8 +79,11 @@ export default function PersonelPanel() {
       <div className="tabbar">
         <button className={tab === 'mesai' ? 'active-personel' : ''} onClick={() => setTab('mesai')}>Mesai</button>
         <button className={tab === 'saatler' ? 'active-personel' : ''} onClick={() => setTab('saatler')}>Çalışma Saatlerim</button>
+        <button className={tab === 'gorevler' ? 'active-personel' : ''} onClick={() => setTab('gorevler')}>Görevlerim</button>
         <button className={tab === 'arac' ? 'active-personel' : ''} onClick={() => setTab('arac')}>Araç</button>
-        <button className={tab === 'veri' ? 'active-personel' : ''} onClick={() => setTab('veri')}>Saha Verisi</button>
+        {oturum.rol === 'ustabasi' && (
+          <button className={tab === 'veri' ? 'active-personel' : ''} onClick={() => setTab('veri')}>Saha Verisi</button>
+        )}
       </div>
       <div className="content">
         {tab === 'mesai' && (
@@ -90,8 +95,9 @@ export default function PersonelPanel() {
           />
         )}
         {tab === 'saatler' && <SaatlerimTab oturum={oturum} />}
+        {tab === 'gorevler' && <GorevlerimTab oturum={oturum} />}
         {tab === 'arac' && <AracTab oturum={oturum} />}
-        {tab === 'veri' && <VeriTab oturum={oturum} aktifLokasyon={aktifLokasyon} />}
+        {tab === 'veri' && oturum.rol === 'ustabasi' && <VeriTab oturum={oturum} aktifLokasyon={aktifLokasyon} />}
       </div>
     </div>
   );
@@ -104,17 +110,25 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
   const [mesaj, setMesaj] = useState(null);
   const [lokasyonlar, setLokasyonlar] = useState([]);
   const [seciliLokasyon, setSeciliLokasyon] = useState('');
+  const [ayarlar, setAyarlar] = useState({ konum_dogrulama_aktif: false, qr_dogrulama_aktif: false });
+
+  const [konumDurum, setKonumDurum] = useState('bekliyor'); // bekliyor | kontrol | basarili | basarisiz
+  const [konumMesaj, setKonumMesaj] = useState('');
+  const [qrDurum, setQrDurum] = useState('bekliyor'); // bekliyor | tariyor | basarili | basarisiz
+  const [qrMesaj, setQrMesaj] = useState('');
 
   useEffect(() => {
     supabase.from('lokasyonlar').select('*').then(({ data }) => {
       setLokasyonlar(data || []);
       if (data && data.length) setSeciliLokasyon(data[0].ad);
     });
+    supabase.from('sistem_ayarlari').select('*').eq('id', 1).maybeSingle().then(({ data }) => {
+      if (data) setAyarlar(data);
+    });
   }, []);
 
   async function durumYukle() {
     setYukleniyor(true);
-    // En son giriş kaydını al (açık ya da kapalı) — bugünkü/son bilinen lokasyonu bilmek için
     const { data } = await supabase
       .from('giris_cikis')
       .select('*')
@@ -127,13 +141,65 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
     setAcikKayit(acikMi ? data : null);
     lokasyonAyarlandi(data ? data.lokasyon : null);
     setYukleniyor(false);
+    konumSifirla();
   }
 
   useEffect(() => { durumYukle(); }, []); // eslint-disable-line
 
+  function konumSifirla() {
+    setKonumDurum('bekliyor'); setKonumMesaj('');
+    setQrDurum('bekliyor'); setQrMesaj('');
+  }
+  useEffect(() => { konumSifirla(); }, [seciliLokasyon]);
+
+  // Şu an doğrulanması gereken lokasyon: giriş yapılıyorsa seçilen, çıkış yapılıyorsa aktif kayıttaki lokasyon.
+  const hedefLokasyon = acikKayit
+    ? lokasyonlar.find((l) => l.ad === acikKayit.lokasyon)
+    : lokasyonlar.find((l) => l.ad === seciliLokasyon);
+
+  async function konumDogrula() {
+    setKonumDurum('kontrol'); setKonumMesaj('');
+    if (!hedefLokasyon || hedefLokasyon.enlem == null || hedefLokasyon.boylam == null) {
+      setKonumDurum('basarisiz');
+      setKonumMesaj('Bu lokasyon için konum bilgisi tanımlanmamış. Patronunuzla iletişime geçin.');
+      return;
+    }
+    try {
+      const { lat, lon } = await konumAl();
+      const mesafe = mesafeMetre(lat, lon, hedefLokasyon.enlem, hedefLokasyon.boylam);
+      const izinliMesafe = hedefLokasyon.yaricap_metre || 150;
+      if (mesafe <= izinliMesafe) {
+        setKonumDurum('basarili');
+        setKonumMesaj('Konum doğrulandı (yaklaşık ' + mesafe + ' m).');
+      } else {
+        setKonumDurum('basarisiz');
+        setKonumMesaj('Sahada değilsiniz. Lokasyona ' + mesafe + ' m uzaktasınız (izin verilen: ' + izinliMesafe + ' m).');
+      }
+    } catch (err) {
+      setKonumDurum('basarisiz');
+      setKonumMesaj(err.message);
+    }
+  }
+
+  function qrOkundu(kod) {
+    if (hedefLokasyon && kod === hedefLokasyon.qr_kodu) {
+      setQrDurum('basarili');
+      setQrMesaj('QR kod doğrulandı.');
+    } else {
+      setQrDurum('basarisiz');
+      setQrMesaj('Bu QR kod bu lokasyona ait değil.');
+    }
+  }
+
+  const dogrulamaGerekli = ayarlar.konum_dogrulama_aktif || ayarlar.qr_dogrulama_aktif;
+  const dogrulamaTamam =
+    (!ayarlar.konum_dogrulama_aktif || konumDurum === 'basarili') &&
+    (!ayarlar.qr_dogrulama_aktif || qrDurum === 'basarili');
+
   async function girisYap() {
     setMesaj(null);
     if (!seciliLokasyon) { setMesaj({ tip: 'err', metin: 'Lütfen bugünkü lokasyonunuzu seçin.' }); return; }
+    if (dogrulamaGerekli && !dogrulamaTamam) { setMesaj({ tip: 'err', metin: 'Önce konum/QR doğrulamasını tamamlayın.' }); return; }
     const now = new Date().toISOString();
     const { error } = await supabase.from('giris_cikis').insert({
       personel_no: oturum.personel_no,
@@ -149,6 +215,7 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
 
   async function cikisYap() {
     setMesaj(null);
+    if (dogrulamaGerekli && !dogrulamaTamam) { setMesaj({ tip: 'err', metin: 'Önce konum/QR doğrulamasını tamamlayın.' }); return; }
     const now = new Date();
     const girisSaati = new Date(acikKayit.giris_saati);
     const hamSure = (now - girisSaati) / 3600000;
@@ -192,10 +259,42 @@ function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
           <span className={'dot ' + (icerde ? 'icerde' : 'disarda')}></span>
           <span>{yukleniyor ? 'durum kontrol ediliyor' : (oturum.ad + (icerde ? ' şu an içeride' : ' şu an dışarıda'))}</span>
         </div>
+
+        {dogrulamaGerekli && !yukleniyor && (
+          <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            {ayarlar.konum_dogrulama_aktif && (
+              <div style={{ marginBottom: 10 }}>
+                {konumDurum !== 'basarili' && (
+                  <button className="action btn-secondary" onClick={konumDogrula} disabled={konumDurum === 'kontrol'}>
+                    {konumDurum === 'kontrol' ? '📍 Konum kontrol ediliyor...' : '📍 Konumu Doğrula'}
+                  </button>
+                )}
+                {konumDurum === 'basarili' && <div className="feedback ok">✅ {konumMesaj}</div>}
+                {konumDurum === 'basarisiz' && <div className="feedback err">{konumMesaj}</div>}
+              </div>
+            )}
+            {ayarlar.qr_dogrulama_aktif && (
+              <div>
+                {qrDurum !== 'basarili' && qrDurum !== 'tariyor' && (
+                  <button className="action btn-secondary" onClick={() => setQrDurum('tariyor')}>📷 QR Kodu Okut</button>
+                )}
+                {qrDurum === 'tariyor' && (
+                  <QrOkuyucu
+                    onOkundu={qrOkundu}
+                    onIptal={(hata) => { setQrDurum('bekliyor'); if (hata) setQrMesaj(hata); }}
+                  />
+                )}
+                {qrDurum === 'basarili' && <div className="feedback ok">✅ {qrMesaj}</div>}
+                {qrDurum === 'basarisiz' && <div className="feedback err">{qrMesaj}</div>}
+              </div>
+            )}
+          </div>
+        )}
+
         <button
           className={'action btn-punch' + (icerde ? ' cikis' : '')}
           onClick={icerde ? cikisYap : girisYap}
-          disabled={yukleniyor || (!icerde && !lokasyonlar.length)}
+          disabled={yukleniyor || (!icerde && !lokasyonlar.length) || (dogrulamaGerekli && !dogrulamaTamam)}
         >
           {icerde ? 'Çıkış Yap' : 'Giriş Yap'}
         </button>
@@ -275,6 +374,115 @@ function SaatlerimTab({ oturum }) {
         </table>
       </div>
     </>
+  );
+}
+
+/* ---------------- GÖREVLERİM ---------------- */
+function GorevlerimTab({ oturum }) {
+  const [gorevler, setGorevler] = useState([]);
+  const [yukleniyor, setYukleniyor] = useState(true);
+  const [durumFiltre, setDurumFiltre] = useState('Tümü');
+  const [hedefGorev, setHedefGorev] = useState(null);
+  const [fotoYukleniyor, setFotoYukleniyor] = useState(false);
+  const dosyaInputRef = useRef(null);
+
+  async function yukle() {
+    setYukleniyor(true);
+    const { data } = await supabase
+      .from('gorevler')
+      .select('*')
+      .contains('atanan_personel_no', [oturum.personel_no])
+      .order('olusturulma_tarihi', { ascending: false });
+    setGorevler(data || []);
+    setYukleniyor(false);
+  }
+
+  useEffect(() => { yukle(); }, [oturum.personel_no]); // eslint-disable-line
+
+  async function durumDegistir(gorev, yeniDurum) {
+    await supabase.from('gorevler').update({
+      durum: yeniDurum,
+      tamamlanma_tarihi: yeniDurum === 'Tamamlandı' ? new Date().toISOString() : null,
+    }).eq('id', gorev.id);
+    yukle();
+  }
+
+  function tamamlamaBaslat(gorev) {
+    setHedefGorev(gorev);
+    dosyaInputRef.current?.click();
+  }
+
+  async function fotoSecildiVeTamamlandi(e) {
+    const dosya = e.target.files?.[0];
+    e.target.value = '';
+    if (!dosya || !hedefGorev) return;
+    setFotoYukleniyor(true);
+    const dosyaAdi = Date.now() + '-' + dosya.name.replace(/\s+/g, '-');
+    const { error: yuklemeHatasi } = await supabase.storage.from('gorev-fotolari').upload(dosyaAdi, dosya);
+    if (yuklemeHatasi) {
+      alert('Fotoğraf yüklenemedi: ' + yuklemeHatasi.message);
+      setFotoYukleniyor(false);
+      return;
+    }
+    const { data: urlData } = supabase.storage.from('gorev-fotolari').getPublicUrl(dosyaAdi);
+    await supabase.from('gorevler').update({
+      durum: 'Tamamlandı',
+      tamamlanma_tarihi: new Date().toISOString(),
+      tamamlanma_foto_url: urlData.publicUrl,
+    }).eq('id', hedefGorev.id);
+    setFotoYukleniyor(false);
+    setHedefGorev(null);
+    yukle();
+  }
+
+  if (yukleniyor) return <div className="loading-text">Yükleniyor...</div>;
+
+  const gosterilenler = durumFiltre === 'Tümü' ? gorevler : gorevler.filter((g) => g.durum === durumFiltre);
+  const oncelikRengi = { 'Düşük': '#5B6560', 'Normal': '#E8590C', 'Yüksek': '#A0592A', 'Acil': '#B23B0E' };
+
+  return (
+    <div className="card">
+      <h2 className="section">Görevlerim</h2>
+      <input ref={dosyaInputRef} type="file" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={fotoSecildiVeTamamlandi} />
+      <label>Durum filtrele</label>
+      <select value={durumFiltre} onChange={(e) => setDurumFiltre(e.target.value)}>
+        <option>Tümü</option><option>Bekliyor</option><option>Devam Ediyor</option><option>Tamamlandı</option>
+      </select>
+      <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+        {gosterilenler.map((g) => (
+          <div key={g.id} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: 10 }}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>{g.baslik}</div>
+            <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{g.lokasyon}</div>
+            {g.aciklama && <div style={{ fontSize: 13, marginTop: 6 }}>{g.aciklama}</div>}
+            <div style={{ fontSize: 11, marginTop: 6, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 700, color: oncelikRengi[g.oncelik] || 'var(--ink-soft)' }}>{g.oncelik}</span>
+              {g.son_tarih && <span style={{ color: 'var(--ink-soft)' }}>Son tarih: {new Date(g.son_tarih).toLocaleDateString('tr-TR')}</span>}
+              <span className={'status-tag' + (g.durum === 'Tamamlandı' ? ' open' : '')}>{g.durum}</span>
+            </div>
+            {g.tamamlanma_foto_url && (
+              <a href={g.tamamlanma_foto_url} target="_blank" rel="noreferrer" style={{ display: 'inline-block', marginTop: 8 }}>
+                <img src={g.tamamlanma_foto_url} alt="Tamamlanma fotoğrafı" style={{ width: 70, height: 70, objectFit: 'cover', borderRadius: 6 }} />
+              </a>
+            )}
+            <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+              {g.durum === 'Bekliyor' && <button onClick={() => durumDegistir(g, 'Devam Ediyor')} className="action btn-secondary" style={{ width: 'auto', padding: '7px 12px', fontSize: 12, marginTop: 0 }}>Başladım</button>}
+              {g.durum !== 'Tamamlandı' && (
+                <button
+                  onClick={() => tamamlamaBaslat(g)}
+                  className="action btn-punch"
+                  style={{ width: 'auto', padding: '7px 12px', fontSize: 12, marginTop: 0 }}
+                  disabled={fotoYukleniyor && hedefGorev?.id === g.id}
+                >
+                  {fotoYukleniyor && hedefGorev?.id === g.id ? 'Yükleniyor...' : '📷 Fotoğrafla Tamamla'}
+                </button>
+              )}
+              {g.durum === 'Tamamlandı' && <button onClick={() => durumDegistir(g, 'Devam Ediyor')} className="action btn-secondary" style={{ width: 'auto', padding: '7px 12px', fontSize: 12, marginTop: 0 }}>Geri al</button>}
+            </div>
+          </div>
+        ))}
+        {gosterilenler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Size atanmış görev yok.</div>}
+      </div>
+    </div>
   );
 }
 
