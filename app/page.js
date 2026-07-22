@@ -13,6 +13,8 @@ export default function LoginPage() {
 
   async function girisYap(e) {
     e.preventDefault();
+    if (yukleniyor) return; // Çift tıklamaları önleyelim
+    
     setHata('');
     setYukleniyor(true);
 
@@ -23,19 +25,37 @@ export default function LoginPage() {
       .eq('sifre', sifre)
       .maybeSingle();
 
-    setYukleniyor(false);
-
     if (error) {
       setHata('Bağlantı hatası: ' + error.message);
+      setYukleniyor(false);
       return;
     }
+    
     if (!data) {
       setHata('Personel numarası veya şifre hatalı.');
+      setYukleniyor(false);
       return;
     }
 
-    localStorage.setItem('aktifOturum', JSON.stringify(data));
-    router.push(data.rol === 'patron' ? '/patron' : '/personel');
+    // 1. Olası büyük/küçük harf veya boşluk sorunlarını temizleyelim
+    const temizRol = data.rol ? String(data.rol).toLowerCase().trim() : '';
+
+    // 2. LocalStorage verisini güncellenmiş temiz rol ile kaydedelim
+    const oturumVerisi = {
+      ...data,
+      rol: temizRol // 'patron', 'personel' veya 'formen' olarak standartlaştırdık
+    };
+    localStorage.setItem('aktifOturum', JSON.stringify(oturumVerisi));
+
+    // 3. Güvenli Yönlendirme Kontrolü
+    if (temizRol === 'patron') {
+      router.push('/patron');
+    } else if (temizRol === 'personel' || temizRol === 'formen' || temizRol === 'ustabasi') {
+      router.push('/personel');
+    } else {
+      setHata('Bu kullanıcıya tanımlı geçerli bir rol (patron/personel) bulunamadı.');
+      setYukleniyor(false);
+    }
   }
 
   return (
@@ -44,16 +64,17 @@ export default function LoginPage() {
         <h1>Saha Takip</h1>
         <p>Personel numaranız ve şifrenizle giriş yapın.</p>
         <input
-          placeholder="Personel numarası"
+          placeholder="Kullanıcı adı"
           value={personelNo}
           onChange={(e) => setPersonelNo(e.target.value)}
-          inputMode="numeric"
+          required
         />
         <input
           placeholder="Şifre"
           type="password"
           value={sifre}
           onChange={(e) => setSifre(e.target.value)}
+          required
         />
         <button type="submit" disabled={yukleniyor}>
           {yukleniyor ? 'Kontrol ediliyor...' : 'Giriş Yap'}

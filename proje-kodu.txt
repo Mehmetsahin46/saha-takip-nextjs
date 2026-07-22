@@ -1,0 +1,4302 @@
+﻿===== app\api\cron\daily\route.js =====
+import { supabase } from '@/lib/supabase';
+
+export async function GET(request) {
+  return handleDailyReport(request);
+}
+
+export async function POST(request) {
+  return handleDailyReport(request);
+}
+
+async function handleDailyReport(request) {
+  // 1. GÃ¼venlik DoÄŸrulamasÄ± (CRON_SECRET)
+  const authHeader = request.headers.get('Authorization');
+  const { searchParams } = new URL(request.url);
+  const token = searchParams.get('token');
+  const cronSecret = process.env.CRON_SECRET;
+
+  if (cronSecret) {
+    const expectedAuth = `Bearer ${cronSecret}`;
+    if (authHeader !== expectedAuth && token !== cronSecret) {
+      return Response.json({ basari: false, mesaj: 'Yetkisiz eriÅŸim.' }, { status: 401 });
+    }
+  }
+
+  try {
+    // 2. Sistem AyarlarÄ±nÄ± Oku
+    const { data: s, error: sErr } = await supabase
+      .from('sistem_ayarlari')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle();
+
+    if (sErr) {
+      return Response.json({ basari: false, mesaj: 'Sistem ayarlarÄ± okunamadÄ±: ' + sErr.message }, { status: 500 });
+    }
+
+    if (!s) {
+      return Response.json({ basari: false, mesaj: 'Sistem ayarlarÄ± bulunamadÄ±.' }, { status: 404 });
+    }
+
+    if (!s.gunluk_rapor_aktif) {
+      return Response.json({ basari: true, mesaj: 'GÃ¼nlÃ¼k rapor gÃ¶nderme ayarÄ± kapalÄ±.' });
+    }
+
+    if (!s.rapor_eposta || !s.rapor_eposta.trim()) {
+      return Response.json({ basari: false, mesaj: 'Rapor gÃ¶nderilecek e-posta adresi ayarlanmamÄ±ÅŸ.' });
+    }
+
+    const aliciEposta = s.rapor_eposta.trim();
+
+    // 3. Zaman AralÄ±ÄŸÄ±nÄ± Belirle (BugÃ¼n 00:00:00 - 23:59:59)
+    const simdi = new Date();
+    // TÃ¼rkiye saat dilimi (UTC+3) veya yerel saat dilimine gÃ¶re bugÃ¼nÃ¼ belirleyelim.
+    // UTC Ã¼zerinden tarih filtrelemesi iÃ§in bugÃ¼nÃ¼n baÅŸlangÄ±Ã§ ve bitiÅŸini oluÅŸturuyoruz.
+    const startOfToday = new Date(simdi.getFullYear(), simdi.getMonth(), simdi.getDate(), 0, 0, 0, 0).toISOString();
+    const endOfToday = new Date(simdi.getFullYear(), simdi.getMonth(), simdi.getDate(), 23, 59, 59, 999).toISOString();
+
+    // 4. Verileri Supabase'den Ã‡ek
+    // A. GiriÅŸ-Ã‡Ä±kÄ±ÅŸ KayÄ±tlarÄ±
+    const { data: girisCikis } = await supabase
+      .from('giris_cikis')
+      .select('*')
+      .gte('giris_saati', startOfToday)
+      .lte('giris_saati', endOfToday);
+
+    // B. BugÃ¼n Tamamlanan GÃ¶revler
+    const { data: tamamlananGorevler } = await supabase
+      .from('gorevler')
+      .select('*')
+      .eq('durum', 'TamamlandÄ±')
+      .gte('tamamlanma_tarihi', startOfToday)
+      .lte('tamamlanma_tarihi', endOfToday);
+
+    // C. Devam Eden GÃ¶revler
+    const { data: devamEdenGorevler } = await supabase
+      .from('gorevler')
+      .select('*')
+      .eq('durum', 'Devam Ediyor');
+
+    // D. AraÃ§ KullanÄ±mlarÄ±
+    const { data: aracKullanim } = await supabase
+      .from('arac_kullanim')
+      .select('*')
+      .gte('tarih', startOfToday)
+      .lte('tarih', endOfToday);
+
+    // E. BugÃ¼n Girilen Saha MasraflarÄ±
+    const { data: sahaVerileri } = await supabase
+      .from('saha_verileri')
+      .select('*')
+      .gte('tarih', startOfToday)
+      .lte('tarih', endOfToday);
+
+    // 5. Ä°statistikleri Hesapla
+    const aktifPersonelSayisi = new Set((girisCikis || []).map(g => g.personel_no)).size;
+    const toplamMasraf = (sahaVerileri || []).reduce((sum, v) => sum + (Number(v.toplam) || 0), 0);
+    const toplamKatedilenKm = (aracKullanim || []).reduce((sum, a) => sum + (Number(a.katedilen_km) || 0), 0);
+
+    const tarihFormatli = simdi.toLocaleDateString('tr-TR', { day: '2-digit', month: 'long', year: 'numeric', weekday: 'long' });
+
+    // 6. HTML E-posta TaslaÄŸÄ±nÄ± OluÅŸtur
+    const htmlContent = generateDailyReportHtml({
+      tarih: tarihFormatli,
+      aktifPersonelSayisi,
+      toplamMasraf,
+      toplamKatedilenKm,
+      girisCikis: girisCikis || [],
+      tamamlananGorevler: tamamlananGorevler || [],
+      devamEdenGorevler: devamEdenGorevler || [],
+      aracKullanim: aracKullanim || [],
+      sahaVerileri: sahaVerileri || []
+    });
+
+    // 7. E-postayÄ± GÃ¶nder (Resend API)
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey) {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${resendApiKey}`
+        },
+        body: JSON.stringify({
+          from: 'Saha Takip <onboarding@resend.dev>',
+          to: aliciEposta,
+          subject: `GÃ¼nlÃ¼k Saha Takip Ã–zeti â€” ${simdi.toLocaleDateString('tr-TR')}`,
+          html: htmlContent
+        })
+      });
+
+      const resData = await res.json();
+      if (res.ok) {
+        return Response.json({
+          basari: true,
+          gonderildi: true,
+          eposta: aliciEposta,
+          messageId: resData.id
+        });
+      } else {
+        return Response.json({
+          basari: false,
+          gonderildi: false,
+          eposta: aliciEposta,
+          mesaj: 'Resend API hatasÄ±: ' + JSON.stringify(resData),
+          icerik: htmlContent
+        }, { status: 502 });
+      }
+    } else {
+      // API Key tanÄ±mlÄ± deÄŸilse, geliÅŸtirme/test iÃ§in HTML iÃ§eriÄŸi response olarak dÃ¶ner.
+      return Response.json({
+        basari: true,
+        gonderildi: false,
+        eposta: aliciEposta,
+        mesaj: 'RESEND_API_KEY bulunamadÄ±, e-posta gÃ¶nderimi simÃ¼le edildi.',
+        istatistikler: {
+          tarih: tarihFormatli,
+          aktifPersonelSayisi,
+          toplamMasraf,
+          toplamKatedilenKm,
+          girisCikisSayisi: (girisCikis || []).length,
+          tamamlananGorevSayisi: (tamamlananGorevler || []).length,
+          devamEdenGorevSayisi: (devamEdenGorevler || []).length,
+          aracKullanimSayisi: (aracKullanim || []).length,
+          masrafKalemSayisi: (sahaVerileri || []).length
+        },
+        icerik: htmlContent
+      });
+    }
+  } catch (err) {
+    return Response.json({ basari: false, mesaj: 'Sunucu hatasÄ±: ' + err.message }, { status: 500 });
+  }
+}
+
+// OndalÄ±k saati (Ã¶rn. 0.03) "1 dk" veya "1 sa 48 dk" metnine Ã§evirir.
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
+
+function generateDailyReportHtml({
+  tarih,
+  aktifPersonelSayisi,
+  toplamMasraf,
+  toplamKatedilenKm,
+  girisCikis,
+  tamamlananGorevler,
+  devamEdenGorevler,
+  aracKullanim,
+  sahaVerileri
+}) {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GÃ¼nlÃ¼k Ã–zet Raporu</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        line-height: 1.6;
+        color: #2b302d;
+        background-color: #f7f9f8;
+        margin: 0;
+        padding: 0;
+      }
+      .wrapper {
+        width: 100%;
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 20px 0;
+      }
+      .container {
+        background-color: #ffffff;
+        border: 1px solid #e1e5e2;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+      }
+      .header {
+        background: linear-gradient(135deg, #1b3846 0%, #2b4c5c 100%);
+        color: #ffffff;
+        padding: 30px 24px;
+        text-align: center;
+      }
+      .header h1 {
+        margin: 0;
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+      }
+      .header p {
+        margin: 6px 0 0 0;
+        font-size: 14px;
+        opacity: 0.9;
+      }
+      .content {
+        padding: 24px;
+      }
+      .stats-grid {
+        display: table;
+        width: 100%;
+        margin-bottom: 24px;
+        border-collapse: separate;
+        border-spacing: 10px 0;
+      }
+      .stat-card {
+        display: table-cell;
+        width: 33.33%;
+        background-color: #f0f3f1;
+        border-radius: 8px;
+        padding: 16px;
+        text-align: center;
+        vertical-align: top;
+      }
+      .stat-label {
+        font-size: 11px;
+        color: #5b6560;
+        text-transform: uppercase;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+      }
+      .stat-value {
+        font-size: 18px;
+        font-weight: 700;
+        color: #1b3846;
+      }
+      .section-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #1b3846;
+        border-bottom: 2px solid #e1e5e2;
+        padding-bottom: 8px;
+        margin-top: 24px;
+        margin-bottom: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+      th {
+        text-align: left;
+        background-color: #f7f9f8;
+        color: #5b6560;
+        font-weight: 600;
+        padding: 8px 10px;
+        border-bottom: 1px solid #e1e5e2;
+      }
+      td {
+        padding: 8px 10px;
+        border-bottom: 1px solid #f0f2ee;
+        color: #2b302d;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      .tag {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 700;
+        padding: 2px 6px;
+        border-radius: 4px;
+        text-transform: uppercase;
+      }
+      .tag.open {
+        background-color: #e4f3ea;
+        color: #2f8f5b;
+      }
+      .tag.closed {
+        background-color: #f0f2ee;
+        color: #5b6560;
+      }
+      .tag.high {
+        background-color: #fbe9e2;
+        color: #b23b0e;
+      }
+      .empty-state {
+        color: #8c9691;
+        font-style: italic;
+        font-size: 13px;
+        padding: 8px 0;
+      }
+      .footer {
+        background-color: #f7f9f8;
+        border-top: 1px solid #e1e5e2;
+        padding: 16px 24px;
+        text-align: center;
+        font-size: 11px;
+        color: #8c9691;
+      }
+      .footer a {
+        color: #2b4c5c;
+        text-decoration: none;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <div class="container">
+        <!-- Header -->
+        <div class="header">
+          <h1>Saha Takip Sistemi</h1>
+          <p>GÃ¼nlÃ¼k Saha Ã–zet Raporu &bull; ${tarih}</p>
+        </div>
+
+        <!-- Content -->
+        <div class="content">
+          <!-- Stats Grid -->
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Aktif Personel</div>
+              <div class="stat-value">${aktifPersonelSayisi} KiÅŸi</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Toplam Masraf</div>
+              <div class="stat-value">${toplamMasraf.toLocaleString('tr-TR')} TL</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Kat Edilen Yol</div>
+              <div class="stat-value">${toplamKatedilenKm.toLocaleString('tr-TR')} km</div>
+            </div>
+          </div>
+
+          <!-- Mesai GiriÅŸ-Ã‡Ä±kÄ±ÅŸ KayÄ±tlarÄ± -->
+          <div class="section-title">Personel Mesai KayÄ±tlarÄ±</div>
+          ${girisCikis.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Ad Soyad</th>
+                  <th>GiriÅŸ Saati</th>
+                  <th>Ã‡Ä±kÄ±ÅŸ Saati</th>
+                  <th>SÃ¼re</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${girisCikis.map(g => `
+                  <tr>
+                    <td><strong>${g.ad}</strong></td>
+                    <td>${g.giris_saati ? new Date(g.giris_saati).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) : 'â€”'}</td>
+                    <td>${g.cikis_saati ? new Date(g.cikis_saati).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) : 'â€”'}</td>
+                    <td>${g.durum === 'AÃ§Ä±k' ? '<span class="tag open">Ä°Ã§eride</span>' : sureFormatla(g.sure_saat)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">BugÃ¼n herhangi bir mesai giriÅŸi yapÄ±lmadÄ±.</div>`}
+
+          <!-- GÃ¶rev Durumu -->
+          <div class="section-title">GÃ¶revler</div>
+          
+          <div style="margin-bottom: 12px; font-weight: 600; font-size: 13px; color: #1b3846;">BugÃ¼n Tamamlanan GÃ¶revler:</div>
+          ${tamamlananGorevler.length > 0 ? `
+            <table style="margin-bottom: 14px;">
+              <thead>
+                <tr>
+                  <th>GÃ¶rev</th>
+                  <th>Lokasyon</th>
+                  <th>Atananlar</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${tamamlananGorevler.map(t => `
+                  <tr>
+                    <td><strong>${t.baslik}</strong></td>
+                    <td>${t.lokasyon}</td>
+                    <td>${(t.atanan_adlar || []).join(', ')}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : `<div class="empty-state" style="margin-bottom: 14px;">BugÃ¼n tamamlanan gÃ¶rev bulunmuyor.</div>`}
+
+          <div style="margin-bottom: 12px; font-weight: 600; font-size: 13px; color: #1b3846;">Aktif Devam Eden GÃ¶revler:</div>
+          ${devamEdenGorevler.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>GÃ¶rev</th>
+                  <th>Lokasyon</th>
+                  <th>Ã–ncelik</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${devamEdenGorevler.map(d => `
+                  <tr>
+                    <td><strong>${d.baslik}</strong></td>
+                    <td>${d.lokasyon}</td>
+                    <td><span class="tag ${d.oncelik === 'Acil' || d.oncelik === 'YÃ¼ksek' ? 'high' : 'closed'}">${d.oncelik}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">Devam eden gÃ¶rev bulunmuyor.</div>`}
+
+          <!-- AraÃ§ KullanÄ±mlarÄ± -->
+          <div class="section-title">AraÃ§ KullanÄ±mlarÄ±</div>
+          ${aracKullanim.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Personel</th>
+                  <th>Plaka</th>
+                  <th>Kat Edilen</th>
+                  <th>Durum</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${aracKullanim.map(a => `
+                  <tr>
+                    <td><strong>${a.ad}</strong></td>
+                    <td>${a.plaka}</td>
+                    <td>${a.katedilen_km ? a.katedilen_km + ' km' : 'â€”'}</td>
+                    <td><span class="tag ${a.durum === 'AÃ§Ä±k' ? 'open' : 'closed'}">${a.durum === 'AÃ§Ä±k' ? 'Teslim Edilmedi' : 'Teslim Edildi'}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">BugÃ¼n araÃ§ kullanÄ±mÄ± yapÄ±lmadÄ±.</div>`}
+
+          <!-- Saha MasraflarÄ± -->
+          <div class="section-title">GÃ¼nlÃ¼k Saha MasraflarÄ±</div>
+          ${sahaVerileri.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Kalem</th>
+                  <th>Lokasyon</th>
+                  <th>Personel</th>
+                  <th>Tutar</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${sahaVerileri.map(v => `
+                  <tr>
+                    <td><strong>${v.kalem_turu}</strong><br><span style="font-size: 11px; color:#5b6560;">${v.aciklama || ''}</span></td>
+                    <td>${v.lokasyon}</td>
+                    <td>${v.ad}</td>
+                    <td><strong>${Number(v.toplam).toLocaleString('tr-TR')} TL</strong></td>
+                  </tr>
+                `).join('')}
+                <tr style="background-color: #f7f9f8; font-weight: 700;">
+                  <td colSpan="3" style="text-align: right; padding-right: 10px;">Toplam:</td>
+                  <td>${toplamMasraf.toLocaleString('tr-TR')} TL</td>
+                </tr>
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">BugÃ¼n herhangi bir saha masrafÄ± girilmedi.</div>`}
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+          Bu e-posta Saha Takip Sistemi tarafÄ±ndan otomatik olarak Ã¼retilmiÅŸtir.<br>
+          Rapor ayarlarÄ±nÄ± deÄŸiÅŸtirmek iÃ§in <a href="#">Patron Paneli > Ayarlar</a> sekmesini kullanabilirsiniz.
+        </div>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+}
+
+
+
+===== app\api\cron\monthly\route.js =====
+import { supabase } from '@/lib/supabase';
+
+export async function GET(request) {
+  return handleMonthlyReport(request);
+}
+
+export async function POST(request) {
+  return handleMonthlyReport(request);
+}
+
+async function handleMonthlyReport(request) {
+  // 1. GÃ¼venlik DoÄŸrulamasÄ± (CRON_SECRET)
+  const authHeader = request.headers.get('Authorization');
+  const { searchParams } = new URL(request.url);
+  const token = searchParams.get('token');
+  const cronSecret = process.env.CRON_SECRET;
+
+  if (cronSecret) {
+    const expectedAuth = `Bearer ${cronSecret}`;
+    if (authHeader !== expectedAuth && token !== cronSecret) {
+      return Response.json({ basari: false, mesaj: 'Yetkisiz eriÅŸim.' }, { status: 401 });
+    }
+  }
+
+  try {
+    // 2. Sistem AyarlarÄ±nÄ± Oku
+    const { data: s, error: sErr } = await supabase
+      .from('sistem_ayarlari')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle();
+
+    if (sErr) {
+      return Response.json({ basari: false, mesaj: 'Sistem ayarlarÄ± okunamadÄ±: ' + sErr.message }, { status: 500 });
+    }
+
+    if (!s) {
+      return Response.json({ basari: false, mesaj: 'Sistem ayarlarÄ± bulunamadÄ±.' }, { status: 404 });
+    }
+
+    if (!s.aylik_rapor_aktif) {
+      return Response.json({ basari: true, mesaj: 'AylÄ±k rapor gÃ¶nderme ayarÄ± kapalÄ±.' });
+    }
+
+    if (!s.rapor_eposta || !s.rapor_eposta.trim()) {
+      return Response.json({ basari: false, mesaj: 'Rapor gÃ¶nderilecek e-posta adresi ayarlanmamÄ±ÅŸ.' });
+    }
+
+    const aliciEposta = s.rapor_eposta.trim();
+
+    // 3. Zaman AralÄ±ÄŸÄ±nÄ± Belirle (GeÃ§en AyÄ±n 1. GÃ¼nÃ¼ 00:00:00'den Son GÃ¼nÃ¼ 23:59:59'a kadar)
+    const simdi = new Date();
+    const yil = simdi.getFullYear();
+    const ay = simdi.getMonth(); // 0-indexed. Ã–rn: Temmuz ise ay = 6. GeÃ§en ay Haziran (5).
+
+    // GeÃ§en ayÄ±n baÅŸlangÄ±cÄ± (1. gÃ¼nÃ¼)
+    const startOfPrevMonth = new Date(yil, ay - 1, 1, 0, 0, 0, 0);
+    // GeÃ§en ayÄ±n bitiÅŸi (bu ayÄ±n 0. gÃ¼nÃ¼ geÃ§en ayÄ±n son gÃ¼nÃ¼dÃ¼r)
+    const endOfPrevMonth = new Date(yil, ay, 0, 23, 59, 59, 999);
+
+    const startIso = startOfPrevMonth.toISOString();
+    const endIso = endOfPrevMonth.toISOString();
+
+    const gecenAyAdi = startOfPrevMonth.toLocaleDateString('tr-TR', { month: 'long', year: 'numeric' });
+
+    // 4. Verileri Supabase'den Ã‡ek
+    // A. GeÃ§en AyÄ±n Mesai KayÄ±tlarÄ±
+    const { data: mesailer } = await supabase
+      .from('giris_cikis')
+      .select('*')
+      .eq('durum', 'KapalÄ±')
+      .gte('giris_saati', startIso)
+      .lte('giris_saati', endIso);
+
+    // B. GeÃ§en Ay Tamamlanan GÃ¶revler
+    const { data: tamamlananGorevler } = await supabase
+      .from('gorevler')
+      .select('*')
+      .eq('durum', 'TamamlandÄ±')
+      .gte('tamamlanma_tarihi', startIso)
+      .lte('tamamlanma_tarihi', endIso);
+
+    // C. GeÃ§en AyÄ±n AraÃ§ KullanÄ±mlarÄ±
+    const { data: aracKullanim } = await supabase
+      .from('arac_kullanim')
+      .select('*')
+      .gte('tarih', startIso)
+      .lte('tarih', endIso);
+
+    // D. GeÃ§en AyÄ±n Saha MasraflarÄ±
+    const { data: sahaVerileri } = await supabase
+      .from('saha_verileri')
+      .select('*')
+      .gte('tarih', startIso)
+      .lte('tarih', endIso);
+
+    // 5. Ä°statistikleri Hesapla
+    // A. Ã‡alÄ±ÅŸma Saatleri (Personel BazlÄ±)
+    let toplamSureSaat = 0;
+    const personelSureleri = {}; // { 'Ad Soyad': toplamSaat }
+    (mesailer || []).forEach(m => {
+      const sure = Number(m.sure_saat) || 0;
+      toplamSureSaat += sure;
+      personelSureleri[m.ad] = (personelSureleri[m.ad] || 0) + sure;
+    });
+
+    const personelOzetListesi = Object.entries(personelSureleri)
+      .map(([ad, saat]) => ({ ad, saat: Math.round(saat * 100) / 100 }))
+      .sort((a, b) => b.saat - a.saat);
+
+    // B. Masraflar (Lokasyon BazlÄ±)
+    let toplamMasraf = 0;
+    const lokasyonMasraflari = {}; // { 'Åantiye A': toplamMasraf }
+    (sahaVerileri || []).forEach(v => {
+      const tutar = Number(v.toplam) || 0;
+      toplamMasraf += tutar;
+      lokasyonMasraflari[v.lokasyon] = (lokasyonMasraflari[v.lokasyon] || 0) + tutar;
+    });
+
+    const lokasyonMasrafListesi = Object.entries(lokasyonMasraflari)
+      .map(([lokasyon, tutar]) => ({ lokasyon, tutar }))
+      .sort((a, b) => b.tutar - a.tutar);
+
+    // C. AraÃ§ KM & Maliyetleri (Plaka BazlÄ±)
+    let toplamKm = 0;
+    const aracKullanimOzet = {}; // { '34 ABC 123': { km: 0, sefer: 0 } }
+    (aracKullanim || []).forEach(a => {
+      const km = Number(a.katedilen_km) || 0;
+      toplamKm += km;
+      if (!aracKullanimOzet[a.plaka]) {
+        aracKullanimOzet[a.plaka] = { km: 0, sefer: 0 };
+      }
+      aracKullanimOzet[a.plaka].km += km;
+      aracKullanimOzet[a.plaka].sefer += 1;
+    });
+
+    const KM_BIRIM_MALIYET = 5; // 5 TL / km
+    const aracListesi = Object.entries(aracKullanimOzet)
+      .map(([plaka, veri]) => ({
+        plaka,
+        km: veri.km,
+        sefer: veri.sefer,
+        maliyet: veri.km * KM_BIRIM_MALIYET
+      }))
+      .sort((a, b) => b.km - a.km);
+
+    const tahminiToplamAracMaliyeti = toplamKm * KM_BIRIM_MALIYET;
+
+    // 6. HTML E-posta TaslaÄŸÄ±nÄ± OluÅŸtur
+    const htmlContent = generateMonthlyReportHtml({
+      ayAdi: gecenAyAdi,
+      toplamSureSaat: Math.round(toplamSureSaat * 100) / 100,
+      toplamMasraf,
+      toplamKm,
+      tahminiToplamAracMaliyeti,
+      tamamlananGorevSayisi: (tamamlananGorevler || []).length,
+      personelOzetListesi,
+      lokasyonMasrafListesi,
+      aracListesi
+    });
+
+    // 7. E-postayÄ± GÃ¶nder (Resend API)
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey) {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${resendApiKey}`
+        },
+        body: JSON.stringify({
+          from: 'Saha Takip <onboarding@resend.dev>',
+          to: aliciEposta,
+          subject: `AylÄ±k Saha Takip Performans Ã–zeti â€” ${gecenAyAdi}`,
+          html: htmlContent
+        })
+      });
+
+      const resData = await res.json();
+      if (res.ok) {
+        return Response.json({
+          basari: true,
+          gonderildi: true,
+          eposta: aliciEposta,
+          messageId: resData.id
+        });
+      } else {
+        return Response.json({
+          basari: false,
+          gonderildi: false,
+          eposta: aliciEposta,
+          mesaj: 'Resend API hatasÄ±: ' + JSON.stringify(resData),
+          icerik: htmlContent
+        }, { status: 502 });
+      }
+    } else {
+      // API Key tanÄ±mlÄ± deÄŸilse, geliÅŸtirme/test iÃ§in HTML iÃ§eriÄŸi response olarak dÃ¶ner.
+      return Response.json({
+        basari: true,
+        gonderildi: false,
+        eposta: aliciEposta,
+        mesaj: 'RESEND_API_KEY bulunamadÄ±, e-posta gÃ¶nderimi simÃ¼le edildi.',
+        istatistikler: {
+          ayAdi: gecenAyAdi,
+          toplamSureSaat,
+          toplamMasraf,
+          toplamKm,
+          tahminiToplamAracMaliyeti,
+          tamamlananGorevSayisi: (tamamlananGorevler || []).length,
+          personelSayisi: personelOzetListesi.length,
+          lokasyonSayisi: lokasyonMasrafListesi.length,
+          aracSayisi: aracListesi.length
+        },
+        icerik: htmlContent
+      });
+    }
+  } catch (err) {
+    return Response.json({ basari: false, mesaj: 'Sunucu hatasÄ±: ' + err.message }, { status: 500 });
+  }
+}
+
+// OndalÄ±k saati (Ã¶rn. 10.5) "10 sa 30 dk" metnine Ã§evirir.
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
+
+function generateMonthlyReportHtml({
+  ayAdi,
+  toplamSureSaat,
+  toplamMasraf,
+  toplamKm,
+  tahminiToplamAracMaliyeti,
+  tamamlananGorevSayisi,
+  personelOzetListesi,
+  lokasyonMasrafListesi,
+  aracListesi
+}) {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AylÄ±k Performans Raporu</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        line-height: 1.6;
+        color: #2b302d;
+        background-color: #f7f9f8;
+        margin: 0;
+        padding: 0;
+      }
+      .wrapper {
+        width: 100%;
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 20px 0;
+      }
+      .container {
+        background-color: #ffffff;
+        border: 1px solid #e1e5e2;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+      }
+      .header {
+        background: linear-gradient(135deg, #1b3846 0%, #1b5e5c 100%);
+        color: #ffffff;
+        padding: 35px 24px;
+        text-align: center;
+      }
+      .header h1 {
+        margin: 0;
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+      }
+      .header p {
+        margin: 6px 0 0 0;
+        font-size: 15px;
+        opacity: 0.95;
+      }
+      .content {
+        padding: 24px;
+      }
+      .stats-grid {
+        display: table;
+        width: 100%;
+        margin-bottom: 24px;
+        border-collapse: separate;
+        border-spacing: 8px 0;
+      }
+      .stat-card {
+        display: table-cell;
+        width: 25%;
+        background-color: #f0f3f1;
+        border-radius: 8px;
+        padding: 12px 8px;
+        text-align: center;
+        vertical-align: top;
+      }
+      .stat-label {
+        font-size: 10px;
+        color: #5b6560;
+        text-transform: uppercase;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+      }
+      .stat-value {
+        font-size: 15px;
+        font-weight: 700;
+        color: #1b3846;
+        word-break: break-word;
+      }
+      .section-title {
+        font-size: 14px;
+        font-weight: 700;
+        color: #1b3846;
+        border-bottom: 2px solid #e1e5e2;
+        padding-bottom: 8px;
+        margin-top: 28px;
+        margin-bottom: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+      th {
+        text-align: left;
+        background-color: #f7f9f8;
+        color: #5b6560;
+        font-weight: 600;
+        padding: 8px 10px;
+        border-bottom: 1px solid #e1e5e2;
+      }
+      td {
+        padding: 8px 10px;
+        border-bottom: 1px solid #f0f2ee;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      .empty-state {
+        color: #8c9691;
+        font-style: italic;
+        font-size: 13px;
+        padding: 8px 0;
+      }
+      .footer {
+        background-color: #f7f9f8;
+        border-top: 1px solid #e1e5e2;
+        padding: 16px 24px;
+        text-align: center;
+        font-size: 11px;
+        color: #8c9691;
+      }
+      .footer a {
+        color: #1b5e5c;
+        text-decoration: none;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <div class="container">
+        <!-- Header -->
+        <div class="header">
+          <h1>Saha Takip Sistemi</h1>
+          <p>AylÄ±k Performans Raporu &bull; ${ayAdi}</p>
+        </div>
+
+        <!-- Content -->
+        <div class="content">
+          <!-- Stats Grid -->
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Toplam Mesai</div>
+              <div class="stat-value">${sureFormatla(toplamSureSaat)}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Toplam Masraf</div>
+              <div class="stat-value">${toplamMasraf.toLocaleString('tr-TR')} TL</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Toplam KM</div>
+              <div class="stat-value">${toplamKm.toLocaleString('tr-TR')} km</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Biten GÃ¶rev</div>
+              <div class="stat-value">${tamamlananGorevSayisi} Adet</div>
+            </div>
+          </div>
+
+          <!-- Personel Performans Listesi -->
+          <div class="section-title">Personel Ã‡alÄ±ÅŸma Saatleri</div>
+          ${personelOzetListesi.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>SÄ±ra</th>
+                  <th>Personel Ad Soyad</th>
+                  <th style="text-align: right;">Toplam Ã‡alÄ±ÅŸma SÃ¼resi</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${personelOzetListesi.map((p, index) => `
+                  <tr>
+                    <td style="width: 40px; color:#8c9691;">#${index + 1}</td>
+                    <td><strong>${p.ad}</strong></td>
+                    <td style="text-align: right; font-weight: 600; color: #1b3846;">${sureFormatla(p.saat)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">GeÃ§en ay tamamlanmÄ±ÅŸ mesai kaydÄ± bulunmuyor.</div>`}
+
+          <!-- Lokasyon BazlÄ± Masraf Raporu -->
+          <div class="section-title">Lokasyon BazlÄ± Masraf DaÄŸÄ±lÄ±mÄ±</div>
+          ${lokasyonMasrafListesi.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Lokasyon</th>
+                  <th style="text-align: right;">Toplam Harcama</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${lokasyonMasrafListesi.map(l => `
+                  <tr>
+                    <td><strong>${l.lokasyon}</strong></td>
+                    <td style="text-align: right; font-weight: 600; color: #b23b0e;">${l.tutar.toLocaleString('tr-TR')} TL</td>
+                  </tr>
+                `).join('')}
+                <tr style="background-color: #f7f9f8; font-weight: 700;">
+                  <td style="text-align: left;">Genel Toplam Masraf:</td>
+                  <td style="text-align: right; color: #b23b0e;">${toplamMasraf.toLocaleString('tr-TR')} TL</td>
+                </tr>
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">GeÃ§en ay saha masraf kaydÄ± bulunmuyor.</div>`}
+
+          <!-- AraÃ§ Filosu KullanÄ±mÄ± ve Maliyet -->
+          <div class="section-title">AraÃ§ Filosu ve Tahmini Maliyet</div>
+          <div style="font-size:12px; color:#5b6560; margin-bottom: 10px; font-style: italic;">
+            Tahmini araÃ§ maliyeti KM baÅŸÄ±na 5 TL (yakÄ±t, bakÄ±m, aÅŸÄ±nma) olarak hesaplanmaktadÄ±r.
+          </div>
+          ${aracListesi.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Plaka</th>
+                  <th>Sefer</th>
+                  <th>YapÄ±lan KM</th>
+                  <th style="text-align: right;">Tahmini Maliyet</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${aracListesi.map(a => `
+                  <tr>
+                    <td><strong>${a.plaka}</strong></td>
+                    <td>${a.sefer} Sefer</td>
+                    <td>${a.km.toLocaleString('tr-TR')} km</td>
+                    <td style="text-align: right; font-weight: 600;">${a.maliyet.toLocaleString('tr-TR')} TL</td>
+                  </tr>
+                `).join('')}
+                <tr style="background-color: #f7f9f8; font-weight: 700;">
+                  <td colSpan="2" style="text-align: left;">Toplam Filo KM:</td>
+                  <td>${toplamKm.toLocaleString('tr-TR')} km</td>
+                  <td style="text-align: right; color:#1b3846;">${tahminiToplamAracMaliyeti.toLocaleString('tr-TR')} TL</td>
+                </tr>
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">GeÃ§en ay herhangi bir araÃ§ kullanÄ±mÄ± yapÄ±lmadÄ±.</div>`}
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+          Bu e-posta Saha Takip Sistemi tarafÄ±ndan otomatik olarak Ã¼retilmiÅŸtir.<br>
+          Rapor ayarlarÄ±nÄ± deÄŸiÅŸtirmek iÃ§in <a href="#">Patron Paneli > Ayarlar</a> sekmesini kullanabilirsiniz.
+        </div>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+}
+
+
+
+===== app\api\cron\test-email\route.js =====
+import { supabase } from '@/lib/supabase';
+
+export async function POST(request) {
+  try {
+    const { eposta } = await request.json();
+
+    if (!eposta || !eposta.trim()) {
+      return Response.json({ basari: false, mesaj: 'E-posta adresi belirtilmedi.' }, { status: 400 });
+    }
+
+    const aliciEposta = eposta.trim();
+
+    // ÅÄ±k bir HTML Test E-postasÄ± iÃ§eriÄŸi
+    const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Saha Takip - Test E-postasÄ±</title>
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          line-height: 1.6;
+          color: #2b302d;
+          background-color: #f7f9f8;
+          margin: 0;
+          padding: 40px 20px;
+        }
+        .container {
+          background-color: #ffffff;
+          border: 1px solid #e1e5e2;
+          border-radius: 12px;
+          overflow: hidden;
+          max-width: 500px;
+          margin: 0 auto;
+          box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+        }
+        .header {
+          background: linear-gradient(135deg, #2b4c5c 0%, #1b3846 100%);
+          color: #ffffff;
+          padding: 24px;
+          text-align: center;
+        }
+        .header h1 {
+          margin: 0;
+          font-size: 20px;
+          font-weight: 700;
+        }
+        .content {
+          padding: 24px;
+          text-align: center;
+        }
+        .success-icon {
+          font-size: 48px;
+          margin-bottom: 16px;
+        }
+        .button {
+          display: inline-block;
+          background-color: #2b4c5c;
+          color: #ffffff !important;
+          text-decoration: none;
+          padding: 10px 20px;
+          border-radius: 6px;
+          font-weight: 600;
+          margin-top: 16px;
+          font-size: 14px;
+        }
+        .footer {
+          background-color: #f7f9f8;
+          border-top: 1px solid #e1e5e2;
+          padding: 16px;
+          font-size: 11px;
+          color: #8c9691;
+          text-align: center;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>Saha Takip Sistemi</h1>
+        </div>
+        <div class="content">
+          <div class="success-icon">ğŸ‰</div>
+          <h2 style="margin-top: 0; color: #2b4c5c;">BaÄŸlantÄ± BaÅŸarÄ±lÄ±!</h2>
+          <p>Bu e-posta, Saha Takip Sistemi e-posta raporlama entegrasyonunun baÅŸarÄ±yla kurulduÄŸunu doÄŸrulamak amacÄ±yla gÃ¶nderilmiÅŸtir.</p>
+          <p>ArtÄ±k sistemden gÃ¼nlÃ¼k ve aylÄ±k saha Ã¶zetlerini belirlediÄŸiniz e-posta adresine otomatik olarak alabilirsiniz.</p>
+          <a href="#" class="button">Sisteme Git</a>
+        </div>
+        <div class="footer">
+          Rapor ayarlarÄ±nÄ± istediÄŸiniz zaman Patron Paneli > Ayarlar sekmesinden deÄŸiÅŸtirebilirsiniz.
+        </div>
+      </div>
+    </body>
+    </html>
+    `;
+
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey) {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${resendApiKey}`
+        },
+        body: JSON.stringify({
+          from: 'Saha Takip <onboarding@resend.dev>',
+          to: aliciEposta,
+          subject: 'Saha Takip Sistemi â€” E-Posta Test BaÄŸlantÄ±sÄ±',
+          html: htmlContent
+        })
+      });
+
+      const resData = await res.json();
+      if (res.ok) {
+        return Response.json({
+          basari: true,
+          mesaj: 'Test e-postasÄ± baÅŸarÄ±yla gÃ¶nderildi! E-posta kutunuzu (ve spam klasÃ¶rÃ¼nÃ¼) kontrol edin.'
+        });
+      } else {
+        return Response.json({
+          basari: false,
+          mesaj: 'Resend gÃ¶nderim hatasÄ±: ' + (resData.message || JSON.stringify(resData))
+        }, { status: 502 });
+      }
+    } else {
+      return Response.json({
+        basari: true,
+        mesaj: 'SimÃ¼lasyon BaÅŸarÄ±lÄ±: RESEND_API_KEY tanÄ±mlÄ± deÄŸil, ancak test e-postasÄ± oluÅŸturma iÅŸlemi yerelde baÅŸarÄ±yla doÄŸrulandÄ±.'
+      });
+    }
+  } catch (err) {
+    return Response.json({ basari: false, mesaj: 'Sunucu hatasÄ±: ' + err.message }, { status: 500 });
+  }
+}
+
+
+
+===== app\api\cron\weekly\route.js =====
+import { supabase } from '@/lib/supabase';
+
+export async function GET(request) {
+  return handleWeeklyReport(request);
+}
+
+export async function POST(request) {
+  return handleWeeklyReport(request);
+}
+
+async function handleWeeklyReport(request) {
+  // 1. GÃ¼venlik DoÄŸrulamasÄ± (CRON_SECRET)
+  const authHeader = request.headers.get('Authorization');
+  const { searchParams } = new URL(request.url);
+  const token = searchParams.get('token');
+  const cronSecret = process.env.CRON_SECRET;
+
+  if (cronSecret) {
+    const expectedAuth = `Bearer ${cronSecret}`;
+    if (authHeader !== expectedAuth && token !== cronSecret) {
+      return Response.json({ basari: false, mesaj: 'Yetkisiz eriÅŸim.' }, { status: 401 });
+    }
+  }
+
+  try {
+    // 2. Sistem AyarlarÄ±nÄ± Oku
+    const { data: s, error: sErr } = await supabase
+      .from('sistem_ayarlari')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle();
+
+    if (sErr) {
+      return Response.json({ basari: false, mesaj: 'Sistem ayarlarÄ± okunamadÄ±: ' + sErr.message }, { status: 500 });
+    }
+
+    if (!s) {
+      return Response.json({ basari: false, mesaj: 'Sistem ayarlarÄ± bulunamadÄ±.' }, { status: 404 });
+    }
+
+    if (!s.haftalik_rapor_aktif) {
+      return Response.json({ basari: true, mesaj: 'HaftalÄ±k rapor gÃ¶nderme ayarÄ± kapalÄ±.' });
+    }
+
+    if (!s.rapor_eposta || !s.rapor_eposta.trim()) {
+      return Response.json({ basari: false, mesaj: 'Rapor gÃ¶nderilecek e-posta adresi ayarlanmamÄ±ÅŸ.' });
+    }
+
+    const aliciEposta = s.rapor_eposta.trim();
+
+    // 3. Zaman AralÄ±ÄŸÄ±nÄ± Belirle (Son 7 GÃ¼n: BugÃ¼n dahil geri doÄŸru 7 gÃ¼n)
+    const simdi = new Date();
+    const startOfWeek = new Date(simdi.getFullYear(), simdi.getMonth(), simdi.getDate() - 6, 0, 0, 0, 0);
+    const endOfWeek = new Date(simdi.getFullYear(), simdi.getMonth(), simdi.getDate(), 23, 59, 59, 999);
+
+    const startIso = startOfWeek.toISOString();
+    const endIso = endOfWeek.toISOString();
+
+    const baslangicFormatli = startOfWeek.toLocaleDateString('tr-TR', { day: '2-digit', month: 'short' });
+    const bitisFormatli = endOfWeek.toLocaleDateString('tr-TR', { day: '2-digit', month: 'short', year: 'numeric' });
+    const haftaAraligiMetni = `${baslangicFormatli} - ${bitisFormatli}`;
+
+    // 4. Verileri Supabase'den Ã‡ek
+    // A. HaftalÄ±k Mesai KayÄ±tlarÄ±
+    const { data: mesailer } = await supabase
+      .from('giris_cikis')
+      .select('*')
+      .eq('durum', 'KapalÄ±')
+      .gte('giris_saati', startIso)
+      .lte('giris_saati', endIso);
+
+    // B. HaftalÄ±k Tamamlanan GÃ¶revler
+    const { data: tamamlananGorevler } = await supabase
+      .from('gorevler')
+      .select('*')
+      .eq('durum', 'TamamlandÄ±')
+      .gte('tamamlanma_tarihi', startIso)
+      .lte('tamamlanma_tarihi', endIso);
+
+    // C. HaftalÄ±k AraÃ§ KullanÄ±mlarÄ±
+    const { data: aracKullanim } = await supabase
+      .from('arac_kullanim')
+      .select('*')
+      .gte('tarih', startIso)
+      .lte('tarih', endIso);
+
+    // D. HaftalÄ±k Saha MasraflarÄ±
+    const { data: sahaVerileri } = await supabase
+      .from('saha_verileri')
+      .select('*')
+      .gte('tarih', startIso)
+      .lte('tarih', endIso);
+
+    // 5. Ä°statistikleri Hesapla
+    // A. Ã‡alÄ±ÅŸma Saatleri (Personel BazlÄ±)
+    let toplamSureSaat = 0;
+    const personelSureleri = {};
+    (mesailer || []).forEach(m => {
+      const sure = Number(m.sure_saat) || 0;
+      toplamSureSaat += sure;
+      personelSureleri[m.ad] = (personelSureleri[m.ad] || 0) + sure;
+    });
+
+    const personelOzetListesi = Object.entries(personelSureleri)
+      .map(([ad, saat]) => ({ ad, saat: Math.round(saat * 100) / 100 }))
+      .sort((a, b) => b.saat - a.saat);
+
+    // B. Masraflar (Lokasyon BazlÄ±)
+    let toplamMasraf = 0;
+    const lokasyonMasraflari = {};
+    (sahaVerileri || []).forEach(v => {
+      const tutar = Number(v.toplam) || 0;
+      toplamMasraf += tutar;
+      lokasyonMasraflari[v.lokasyon] = (lokasyonMasraflari[v.lokasyon] || 0) + tutar;
+    });
+
+    const lokasyonMasrafListesi = Object.entries(lokasyonMasraflari)
+      .map(([lokasyon, tutar]) => ({ lokasyon, tutar }))
+      .sort((a, b) => b.tutar - a.tutar);
+
+    // C. AraÃ§ KM
+    let toplamKm = 0;
+    const aracKullanimOzet = {};
+    (aracKullanim || []).forEach(a => {
+      const km = Number(a.katedilen_km) || 0;
+      toplamKm += km;
+      if (!aracKullanimOzet[a.plaka]) {
+        aracKullanimOzet[a.plaka] = { km: 0, sefer: 0 };
+      }
+      aracKullanimOzet[a.plaka].km += km;
+      aracKullanimOzet[a.plaka].sefer += 1;
+    });
+
+    const KM_BIRIM_MALIYET = 5; // 5 TL / km
+    const aracListesi = Object.entries(aracKullanimOzet)
+      .map(([plaka, veri]) => ({
+        plaka,
+        km: veri.km,
+        sefer: veri.sefer,
+        maliyet: veri.km * KM_BIRIM_MALIYET
+      }))
+      .sort((a, b) => b.km - a.km);
+
+    const tahminiToplamAracMaliyeti = toplamKm * KM_BIRIM_MALIYET;
+
+    // 6. HTML E-posta TaslaÄŸÄ±nÄ± OluÅŸtur
+    const htmlContent = generateWeeklyReportHtml({
+      haftaAraligi: haftaAraligiMetni,
+      toplamSureSaat: Math.round(toplamSureSaat * 100) / 100,
+      toplamMasraf,
+      toplamKm,
+      tahminiToplamAracMaliyeti,
+      tamamlananGorevSayisi: (tamamlananGorevler || []).length,
+      personelOzetListesi,
+      lokasyonMasrafListesi,
+      aracListesi
+    });
+
+    // 7. E-postayÄ± GÃ¶nder (Resend API)
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey) {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${resendApiKey}`
+        },
+        body: JSON.stringify({
+          from: 'Saha Takip <onboarding@resend.dev>',
+          to: aliciEposta,
+          subject: `HaftalÄ±k Saha Takip Ã–zeti â€” ${haftaAraligiMetni}`,
+          html: htmlContent
+        })
+      });
+
+      const resData = await res.json();
+      if (res.ok) {
+        return Response.json({
+          basari: true,
+          gonderildi: true,
+          eposta: aliciEposta,
+          messageId: resData.id
+        });
+      } else {
+        return Response.json({
+          basari: false,
+          gonderildi: false,
+          eposta: aliciEposta,
+          mesaj: 'Resend API hatasÄ±: ' + JSON.stringify(resData),
+          icerik: htmlContent
+        }, { status: 502 });
+      }
+    } else {
+      return Response.json({
+        basari: true,
+        gonderildi: false,
+        eposta: aliciEposta,
+        mesaj: 'RESEND_API_KEY bulunamadÄ±, e-posta gÃ¶nderimi simÃ¼le edildi.',
+        istatistikler: {
+          haftaAraligi: haftaAraligiMetni,
+          toplamSureSaat,
+          toplamMasraf,
+          toplamKm,
+          tahminiToplamAracMaliyeti,
+          tamamlananGorevSayisi: (tamamlananGorevler || []).length,
+          personelSayisi: personelOzetListesi.length,
+          lokasyonSayisi: lokasyonMasrafListesi.length,
+          aracSayisi: aracListesi.length
+        },
+        icerik: htmlContent
+      });
+    }
+  } catch (err) {
+    return Response.json({ basari: false, mesaj: 'Sunucu hatasÄ±: ' + err.message }, { status: 500 });
+  }
+}
+
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
+
+function generateWeeklyReportHtml({
+  haftaAraligi,
+  toplamSureSaat,
+  toplamMasraf,
+  toplamKm,
+  tahminiToplamAracMaliyeti,
+  tamamlananGorevSayisi,
+  personelOzetListesi,
+  lokasyonMasrafListesi,
+  aracListesi
+}) {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HaftalÄ±k Saha Raporu</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        line-height: 1.6;
+        color: #2b302d;
+        background-color: #f7f9f8;
+        margin: 0;
+        padding: 0;
+      }
+      .wrapper {
+        width: 100%;
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 20px 0;
+      }
+      .container {
+        background-color: #ffffff;
+        border: 1px solid #e1e5e2;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+      }
+      .header {
+        background: linear-gradient(135deg, #1b3846 0%, #2b5c56 100%);
+        color: #ffffff;
+        padding: 30px 24px;
+        text-align: center;
+      }
+      .header h1 {
+        margin: 0;
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+      }
+      .header p {
+        margin: 6px 0 0 0;
+        font-size: 14px;
+        opacity: 0.95;
+      }
+      .content {
+        padding: 24px;
+      }
+      .stats-grid {
+        display: table;
+        width: 100%;
+        margin-bottom: 24px;
+        border-collapse: separate;
+        border-spacing: 8px 0;
+      }
+      .stat-card {
+        display: table-cell;
+        width: 25%;
+        background-color: #f0f3f1;
+        border-radius: 8px;
+        padding: 12px 6px;
+        text-align: center;
+        vertical-align: top;
+      }
+      .stat-label {
+        font-size: 9px;
+        color: #5b6560;
+        text-transform: uppercase;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+      }
+      .stat-value {
+        font-size: 14px;
+        font-weight: 700;
+        color: #1b3846;
+      }
+      .section-title {
+        font-size: 14px;
+        font-weight: 700;
+        color: #1b3846;
+        border-bottom: 2px solid #e1e5e2;
+        padding-bottom: 8px;
+        margin-top: 28px;
+        margin-bottom: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+      th {
+        text-align: left;
+        background-color: #f7f9f8;
+        color: #5b6560;
+        font-weight: 600;
+        padding: 8px 10px;
+        border-bottom: 1px solid #e1e5e2;
+      }
+      td {
+        padding: 8px 10px;
+        border-bottom: 1px solid #f0f2ee;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      .empty-state {
+        color: #8c9691;
+        font-style: italic;
+        font-size: 13px;
+        padding: 8px 0;
+      }
+      .footer {
+        background-color: #f7f9f8;
+        border-top: 1px solid #e1e5e2;
+        padding: 16px 24px;
+        text-align: center;
+        font-size: 11px;
+        color: #8c9691;
+      }
+      .footer a {
+        color: #2b5c56;
+        text-decoration: none;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <div class="container">
+        <!-- Header -->
+        <div class="header">
+          <h1>Saha Takip Sistemi</h1>
+          <p>HaftalÄ±k Performans Raporu &bull; ${haftaAraligi}</p>
+        </div>
+
+        <!-- Content -->
+        <div class="content">
+          <!-- Stats Grid -->
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Toplam Mesai</div>
+              <div class="stat-value">${sureFormatla(toplamSureSaat)}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Toplam Masraf</div>
+              <div class="stat-value">${toplamMasraf.toLocaleString('tr-TR')} TL</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Toplam KM</div>
+              <div class="stat-value">${toplamKm.toLocaleString('tr-TR')} km</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Biten GÃ¶rev</div>
+              <div class="stat-value">${tamamlananGorevSayisi} Adet</div>
+            </div>
+          </div>
+
+          <!-- Personel DaÄŸÄ±lÄ±mÄ± -->
+          <div class="section-title">HaftalÄ±k Personel Ã‡alÄ±ÅŸma SÃ¼releri</div>
+          ${personelOzetListesi.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>SÄ±ra</th>
+                  <th>Personel Ad Soyad</th>
+                  <th style="text-align: right;">HaftalÄ±k SÃ¼re</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${personelOzetListesi.map((p, index) => `
+                  <tr>
+                    <td style="width: 40px; color:#8c9691;">#${index + 1}</td>
+                    <td><strong>${p.ad}</strong></td>
+                    <td style="text-align: right; font-weight: 600; color: #1b3846;">${sureFormatla(p.saat)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">Bu hafta tamamlanmÄ±ÅŸ mesai kaydÄ± bulunmuyor.</div>`}
+
+          <!-- Lokasyon HarcamalarÄ± -->
+          <div class="section-title">HaftalÄ±k Lokasyon HarcamalarÄ±</div>
+          ${lokasyonMasrafListesi.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Lokasyon</th>
+                  <th style="text-align: right;">Toplam Tutar</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${lokasyonMasrafListesi.map(l => `
+                  <tr>
+                    <td><strong>${l.lokasyon}</strong></td>
+                    <td style="text-align: right; font-weight: 600; color: #b23b0e;">${l.tutar.toLocaleString('tr-TR')} TL</td>
+                  </tr>
+                `).join('')}
+                <tr style="background-color: #f7f9f8; font-weight: 700;">
+                  <td style="text-align: left;">Toplam:</td>
+                  <td style="text-align: right; color: #b23b0e;">${toplamMasraf.toLocaleString('tr-TR')} TL</td>
+                </tr>
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">Bu hafta saha masraf kaydÄ± bulunmuyor.</div>`}
+
+          <!-- AraÃ§ Filosu KullanÄ±mÄ± -->
+          <div class="section-title">AraÃ§ Filosu HaftalÄ±k Km ve Maliyet</div>
+          ${aracListesi.length > 0 ? `
+            <table>
+              <thead>
+                <tr>
+                  <th>Plaka</th>
+                  <th>Sefer</th>
+                  <th>Mesafe</th>
+                  <th style="text-align: right;">Tahmini Maliyet</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${aracListesi.map(a => `
+                  <tr>
+                    <td><strong>${a.plaka}</strong></td>
+                    <td>${a.sefer} Sefer</td>
+                    <td>${a.km.toLocaleString('tr-TR')} km</td>
+                    <td style="text-align: right; font-weight: 600;">${a.maliyet.toLocaleString('tr-TR')} TL</td>
+                  </tr>
+                `).join('')}
+                <tr style="background-color: #f7f9f8; font-weight: 700;">
+                  <td colSpan="2" style="text-align: left;">Toplam:</td>
+                  <td>${toplamKm.toLocaleString('tr-TR')} km</td>
+                  <td style="text-align: right; color:#1b3846;">${tahminiToplamAracMaliyeti.toLocaleString('tr-TR')} TL</td>
+                </tr>
+              </tbody>
+            </table>
+          ` : `<div class="empty-state">Bu hafta araÃ§ kullanÄ±mÄ± yapÄ±lmadÄ±.</div>`}
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+          Bu e-posta Saha Takip Sistemi tarafÄ±ndan otomatik olarak Ã¼retilmiÅŸtir.<br>
+          Rapor ayarlarÄ±nÄ± istediÄŸiniz zaman Patron Paneli > Ayarlar sekmesinden deÄŸiÅŸtirebilirsiniz.
+        </div>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+}
+
+
+
+===== app\api\teklif\route.js =====
+export async function POST(request) {
+  const { lokasyon, toplamMaliyet, kalemler } = await request.json();
+
+  if (!kalemler || !kalemler.length) {
+    return Response.json({ basari: false, mesaj: 'Bu lokasyon iÃ§in henÃ¼z saha verisi yok.' }, { status: 400 });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return Response.json({ basari: false, mesaj: 'ANTHROPIC_API_KEY tanÄ±mlÄ± deÄŸil (.env.local dosyasÄ±nÄ± kontrol edin).' }, { status: 500 });
+  }
+
+  const kalemMetni = kalemler
+    .map((k) => `- ${k.kalem_turu}: ${k.miktar} birim x ${k.birim_fiyat} TL = ${k.toplam} TL`)
+    .join('\n');
+
+  const prompt = `AÅŸaÄŸÄ±da bir saha projesi iÃ§in girilmiÅŸ maliyet kalemleri var.
+Lokasyon: ${lokasyon}
+Toplam maliyet: ${toplamMaliyet} TL
+Kalemler:
+${kalemMetni}
+
+LÃ¼tfen:
+1. KÄ±sa bir maliyet analizi yap.
+2. GerekÃ§eli bir kÃ¢r marjÄ± Ã¶nererek satÄ±ÅŸ fiyatÄ± Ã¶ner.
+3. MÃ¼ÅŸteriye sunulacak kÄ±sa, profesyonel bir teklif metni taslaÄŸÄ± yaz (2-3 paragraf).
+YanÄ±tÄ± TÃ¼rkÃ§e ver.`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    const data = await response.json();
+    if (!data.content) {
+      return Response.json({ basari: false, mesaj: 'AI yanÄ±tÄ± alÄ±namadÄ±: ' + JSON.stringify(data) }, { status: 500 });
+    }
+
+    const teklifMetni = data.content.map((c) => c.text || '').join('\n');
+    return Response.json({ basari: true, teklifMetni });
+  } catch (err) {
+    return Response.json({ basari: false, mesaj: 'Ä°stek baÅŸarÄ±sÄ±z: ' + err.message }, { status: 500 });
+  }
+}
+
+
+
+===== app\patron\page.js =====
+'use client';
+
+import { useEffect, useState } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts';
+import { useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabase';
+import { getInitialTheme, temaUygula, temaDegistir } from '@/lib/theme';
+import { konumAl } from '@/lib/geo';
+import * as XLSX from 'xlsx';
+import jsPDF from 'jspdf';
+import QRCode from 'qrcode';
+
+const KM_BIRIM_MALIYET = 5; // TL / km, tahmini yakÄ±t + aÅŸÄ±nma
+
+function excelIndir(veriler, dosyaAdi) {
+  const ws = XLSX.utils.json_to_sheet(veriler);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Veri');
+  XLSX.writeFile(wb, dosyaAdi);
+}
+
+function teklifPdfIndir(teklif) {
+  const doc = new jsPDF();
+  doc.setFontSize(16);
+  doc.text('Teklif', 14, 18);
+  doc.setFontSize(11);
+  doc.text('Lokasyon: ' + teklif.lokasyon, 14, 28);
+  doc.text('Tarih: ' + new Date(teklif.tarih).toLocaleString('tr-TR'), 14, 34);
+  doc.text('Toplam Maliyet: ' + Number(teklif.toplam_maliyet).toLocaleString('tr-TR') + ' TL', 14, 40);
+  const satirlar = doc.splitTextToSize(teklif.teklif_metni, 180);
+  doc.text(satirlar, 14, 50);
+  doc.save('teklif-' + teklif.lokasyon.replace(/\s+/g, '-') + '.pdf');
+}
+
+// OndalÄ±k saat deÄŸerini (Ã¶rn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne Ã§evirir.
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
+
+export default function PatronPanel() {
+  const router = useRouter();
+  const [oturum, setOturum] = useState(null);
+  const [tab, setTab] = useState('genel');
+  const [tema, setTema] = useState('light');
+
+  useEffect(() => {
+    const kayit = localStorage.getItem('aktifOturum');
+    if (!kayit) { router.push('/'); return; }
+    const parsed = JSON.parse(kayit);
+    if (parsed.rol !== 'patron') { router.push('/'); return; }
+    setOturum(parsed);
+  }, [router]);
+
+  useEffect(() => {
+    const t = getInitialTheme();
+    setTema(t);
+    temaUygula(t);
+  }, []);
+
+  function cikisYapOturum() {
+    localStorage.removeItem('aktifOturum');
+    router.push('/');
+  }
+
+  if (!oturum) return null;
+
+  return (
+    <div>
+      <div className="app-header">
+        <span className="brand">Saha Takip</span>
+        <span className="who">YÃ¶netim Paneli â€” <b>Patron</b></span>
+        <div>
+          <button className="theme-toggle" onClick={() => setTema(temaDegistir(tema))}>{tema === 'dark' ? 'â˜€ï¸' : 'ğŸŒ™'}</button>
+          <button className="logout" onClick={cikisYapOturum}>Ã‡Ä±kÄ±ÅŸ</button>
+        </div>
+      </div>
+      <div className="tabbar">
+        <button className={tab === 'genel' ? 'active-patron' : ''} onClick={() => setTab('genel')}>Genel BakÄ±ÅŸ</button>
+        <button className={tab === 'lokasyonlar' ? 'active-patron' : ''} onClick={() => setTab('lokasyonlar')}>Lokasyonlar</button>
+        <button className={tab === 'araclar' ? 'active-patron' : ''} onClick={() => setTab('araclar')}>AraÃ§ Filosu</button>
+        <button className={tab === 'gorevler' ? 'active-patron' : ''} onClick={() => setTab('gorevler')}>GÃ¶revler</button>
+        <button className={tab === 'projeler' ? 'active-patron' : ''} onClick={() => setTab('projeler')}>Projeler</button>
+        <button className={tab === 'teklifler' ? 'active-patron' : ''} onClick={() => setTab('teklifler')}>Teklifler</button>
+        <button className={tab === 'ayarlar' ? 'active-patron' : ''} onClick={() => setTab('ayarlar')}>Ayarlar</button>
+      </div>
+      <div className="content">
+        {tab === 'genel' && <GenelBakis />}
+        {tab === 'lokasyonlar' && <Lokasyonlar />}
+        {tab === 'araclar' && <Araclar />}
+        {tab === 'gorevler' && <GorevlerTab />}
+        {tab === 'projeler' && <ProjelerTab />}
+        {tab === 'teklifler' && <Teklifler />}
+        {tab === 'ayarlar' && <Ayarlar />}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- GENEL BAKIÅ ---------------- */
+function GenelBakis() {
+  const [toplamMaliyet, setToplamMaliyet] = useState(0);
+  const [icerdekiler, setIcerdekiler] = useState(0);
+  const [toplamKm, setToplamKm] = useState(0);
+  const [lokasyonOzet, setLokasyonOzet] = useState([]);
+  const [saatGun, setSaatGun] = useState(0);
+  const [saatHafta, setSaatHafta] = useState(0);
+  const [saatAy, setSaatAy] = useState(0);
+  const [personelAySaat, setPersonelAySaat] = useState([]);
+
+  useEffect(() => {
+    (async () => {
+      const { data: veriler } = await supabase.from('saha_verileri').select('lokasyon, toplam');
+      const { count: acikSayisi } = await supabase.from('giris_cikis').select('*', { count: 'exact', head: true }).eq('durum', 'AÃ§Ä±k');
+      const { data: araclar } = await supabase.from('arac_kullanim').select('katedilen_km');
+      const { data: mesailer } = await supabase.from('giris_cikis').select('*').eq('durum', 'KapalÄ±');
+
+      const tm = (veriler || []).reduce((a, v) => a + Number(v.toplam), 0);
+      setToplamMaliyet(tm);
+      setIcerdekiler(acikSayisi || 0);
+      setToplamKm((araclar || []).reduce((a, v) => a + (Number(v.katedilen_km) || 0), 0));
+
+      const grup = {};
+      (veriler || []).forEach((v) => {
+        if (!grup[v.lokasyon]) grup[v.lokasyon] = { adet: 0, toplam: 0 };
+        grup[v.lokasyon].adet += 1;
+        grup[v.lokasyon].toplam += Number(v.toplam);
+      });
+      setLokasyonOzet(Object.entries(grup).map(([lokasyon, v]) => ({ lokasyon, ...v })));
+
+      const now = new Date();
+      const bugunBaslangic = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const haftaBaslangic = new Date(now);
+      haftaBaslangic.setDate(now.getDate() - 7);
+      const ayBaslangic = new Date(now.getFullYear(), now.getMonth(), 1);
+
+      let g = 0, h = 0, a = 0;
+      const kisiAy = {};
+      (mesailer || []).forEach((m) => {
+        const tarih = new Date(m.giris_saati);
+        const sure = Number(m.sure_saat) || 0;
+        if (tarih >= bugunBaslangic) g += sure;
+        if (tarih >= haftaBaslangic) h += sure;
+        if (tarih >= ayBaslangic) {
+          a += sure;
+          kisiAy[m.ad] = (kisiAy[m.ad] || 0) + sure;
+        }
+      });
+      setSaatGun(Math.round(g * 100) / 100);
+      setSaatHafta(Math.round(h * 100) / 100);
+      setSaatAy(Math.round(a * 100) / 100);
+      setPersonelAySaat(Object.entries(kisiAy).map(([ad, saat]) => ({ ad, saat: Math.round(saat * 100) / 100 })).sort((x, y) => y.saat - x.saat));
+    })();
+  }, []);
+
+  return (
+    <>
+      <div className="grid cols-3">
+        <div className="stat-card"><div className="label">Toplam maliyet</div><div className="value">{toplamMaliyet.toLocaleString('tr-TR')} TL</div></div>
+        <div className="stat-card"><div className="label">Åu an iÃ§eride</div><div className="value">{icerdekiler} kiÅŸi</div></div>
+        <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2 className="section">Ã‡alÄ±ÅŸma Saatleri (tÃ¼m personel toplamÄ±)</h2>
+        <button
+          className="action btn-secondary"
+          style={{ marginTop: 8, marginBottom: 4, width: 'auto', padding: '7px 14px', fontSize: 13 }}
+          disabled={!personelAySaat.length && !lokasyonOzet.length}
+          onClick={() => excelIndir(
+            [
+              ...personelAySaat.map((p) => ({ TÃ¼r: 'Personel Ã‡alÄ±ÅŸma', Personel: p.ad, 'Bu Ay (saat)': p.saat.toFixed(2), 'Bu Ay (sÃ¼re)': sureFormatla(p.saat) })),
+              ...lokasyonOzet.map((l) => ({ TÃ¼r: 'Lokasyon Maliyet', Lokasyon: l.lokasyon, 'Kalem SayÄ±sÄ±': l.adet, 'Toplam (TL)': l.toplam })),
+            ],
+            'genel-bakis.xlsx'
+          )}
+        >
+          ğŸ“Š Excelâ€™e Aktar
+        </button>
+        <div className="grid cols-3" style={{ marginTop: 10 }}>
+          <div className="stat-card"><div className="label">BugÃ¼n</div><div className="value">{sureFormatla(saatGun)}</div></div>
+          <div className="stat-card"><div className="label">Bu hafta</div><div className="value">{sureFormatla(saatHafta)}</div></div>
+          <div className="stat-card"><div className="label">Bu ay</div><div className="value">{sureFormatla(saatAy)}</div></div>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 10 }}>SÃ¼reler, her mesaideki 1 saatlik mola dÃ¼ÅŸÃ¼lerek hesaplanmÄ±ÅŸtÄ±r.</div>
+        <table style={{ marginTop: 8 }}>
+          <thead><tr><th>Personel</th><th>Bu ay toplam</th></tr></thead>
+          <tbody>
+            {personelAySaat.map((p) => (
+              <tr key={p.ad}><td>{p.ad}</td><td>{sureFormatla(p.saat)}</td></tr>
+            ))}
+            {personelAySaat.length === 0 && <tr><td colSpan={2}>Bu ay tamamlanmÄ±ÅŸ mesai kaydÄ± yok.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2 className="section">Lokasyon bazlÄ± maliyet</h2>
+        {lokasyonOzet.length > 0 && (
+          <div style={{ width: '100%', height: 220, marginTop: 12 }}>
+            <ResponsiveContainer>
+              <BarChart data={lokasyonOzet}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <XAxis dataKey="lokasyon" tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} />
+                <YAxis tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} />
+                <Tooltip formatter={(v) => v.toLocaleString('tr-TR') + ' TL'} contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', fontSize: 12 }} />
+                <Bar dataKey="toplam" fill="var(--accent-patron)" radius={[6, 6, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+        <table>
+          <thead><tr><th>Lokasyon</th><th>Kalem</th><th>Toplam</th></tr></thead>
+          <tbody>
+            {lokasyonOzet.map((l) => (
+              <tr key={l.lokasyon}><td>{l.lokasyon}</td><td>{l.adet}</td><td>{l.toplam.toLocaleString('tr-TR')} TL</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+/* ---------------- LOKASYONLAR + AI TEKLÄ°F ---------------- */
+function Lokasyonlar() {
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [secili, setSecili] = useState('');
+  const [kalemler, setKalemler] = useState([]);
+  const [teklifMetni, setTeklifMetni] = useState('');
+  const [yukleniyor, setYukleniyor] = useState(false);
+  const [hata, setHata] = useState('');
+
+  useEffect(() => {
+    supabase.from('lokasyonlar').select('*').then(({ data }) => {
+      setLokasyonlar(data || []);
+      if (data && data.length) setSecili(data[0].ad);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!secili) return;
+    setTeklifMetni('');
+    supabase.from('saha_verileri').select('*').eq('lokasyon', secili).then(({ data }) => setKalemler(data || []));
+  }, [secili]);
+
+  const toplam = kalemler.reduce((a, k) => a + Number(k.toplam), 0);
+
+  async function teklifOlustur() {
+    setHata(''); setYukleniyor(true);
+    const res = await fetch('/api/teklif', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lokasyon: secili, toplamMaliyet: toplam, kalemler }),
+    });
+    const data = await res.json();
+    setYukleniyor(false);
+    if (!data.basari) { setHata(data.mesaj); return; }
+    setTeklifMetni(data.teklifMetni);
+    await supabase.from('teklifler').insert({ lokasyon: secili, toplam_maliyet: toplam, teklif_metni: data.teklifMetni, durum: 'Onay Bekliyor' });
+  }
+
+  return (
+    <div className="card">
+      <label>Lokasyon seÃ§</label>
+      <select value={secili} onChange={(e) => setSecili(e.target.value)}>
+        {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
+      </select>
+      <div className="summary-total">{toplam.toLocaleString('tr-TR')} TL</div>
+      <div className="summary-sub">{kalemler.length} kalem girildi</div>
+      <button
+        className="action btn-secondary"
+        style={{ marginTop: 10 }}
+        disabled={!kalemler.length}
+        onClick={() => excelIndir(
+          kalemler.map((k) => ({ Kalem: k.kalem_turu, Personel: k.ad, Miktar: k.miktar, 'Birim Fiyat': k.birim_fiyat, Toplam: k.toplam, AÃ§Ä±klama: k.aciklama || '' })),
+          secili.replace(/\s+/g, '-') + '-maliyet.xlsx'
+        )}
+      >
+        ğŸ“Š Excel'e Aktar
+      </button>
+      <table>
+        <thead><tr><th>Kalem</th><th>Miktar</th><th>Birim</th><th>Toplam</th></tr></thead>
+        <tbody>
+          {kalemler.map((k) => (
+            <tr key={k.id}><td>{k.kalem_turu}</td><td>{k.miktar}</td><td>{k.birim_fiyat} TL</td><td>{Number(k.toplam).toLocaleString('tr-TR')} TL</td></tr>
+          ))}
+        </tbody>
+      </table>
+      <button className="action btn-ai" onClick={teklifOlustur} disabled={yukleniyor || !kalemler.length}>
+        {yukleniyor ? 'Teklif hazÄ±rlanÄ±yor...' : 'AI Teklif OluÅŸtur'}
+      </button>
+      {hata && <div className="feedback err">{hata}</div>}
+      {teklifMetni && <div className="quote-box">{teklifMetni}</div>}
+    </div>
+  );
+}
+
+/* ---------------- ARAÃ‡LAR ---------------- */
+function Araclar() {
+  const [araclar, setAraclar] = useState([]);
+  const [kayitlar, setKayitlar] = useState([]);
+  const [seciliPlaka, setSeciliPlaka] = useState(null);
+  const [baslangicTarih, setBaslangicTarih] = useState('');
+  const [bitisTarih, setBitisTarih] = useState('');
+  const [personelArama, setPersonelArama] = useState('');
+
+  useEffect(() => {
+    supabase.from('araclar').select('*').then(({ data }) => setAraclar(data || []));
+    supabase.from('arac_kullanim').select('*').order('tarih', { ascending: false }).then(({ data }) => setKayitlar(data || []));
+  }, []);
+
+  let gosterilenKayitlar = seciliPlaka ? kayitlar.filter((k) => k.plaka === seciliPlaka) : kayitlar;
+  if (baslangicTarih) gosterilenKayitlar = gosterilenKayitlar.filter((k) => new Date(k.tarih) >= new Date(baslangicTarih));
+  if (bitisTarih) gosterilenKayitlar = gosterilenKayitlar.filter((k) => new Date(k.tarih) <= new Date(bitisTarih + 'T23:59:59'));
+  if (personelArama.trim()) gosterilenKayitlar = gosterilenKayitlar.filter((k) => k.ad.toLocaleLowerCase('tr-TR').includes(personelArama.trim().toLocaleLowerCase('tr-TR')));
+
+  const toplamKm = gosterilenKayitlar.reduce((a, k) => a + (Number(k.katedilen_km) || 0), 0);
+
+  function sureMetni(baslangic, bitis) {
+    if (!baslangic || !bitis) return 'â€”';
+    const dakika = Math.round((new Date(bitis) - new Date(baslangic)) / 60000);
+    if (dakika < 60) return dakika + ' dk';
+    return Math.floor(dakika / 60) + ' sa ' + (dakika % 60) + ' dk';
+  }
+
+  function kartaTiklandi(e, plaka) {
+    e.stopPropagation();
+    setSeciliPlaka((mevcut) => (mevcut === plaka ? null : plaka));
+  }
+
+  return (
+    <div onClick={() => setSeciliPlaka(null)}>
+      <div className="card">
+        <h2 className="section">AraÃ§ Filosu</h2>
+        {seciliPlaka && (
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 6 }}>
+            <b style={{ color: 'var(--ink)' }}>{seciliPlaka}</b> filtreleniyor â€” seÃ§imi kaldÄ±rmak iÃ§in boÅŸ bir yere tÄ±klayÄ±n.
+          </div>
+        )}
+        <div className="grid cols-3" style={{ marginTop: 10 }}>
+          {araclar.map((a) => {
+            const secili = seciliPlaka === a.plaka;
+            return (
+              <div
+                key={a.plaka}
+                className="card"
+                onClick={(e) => kartaTiklandi(e, a.plaka)}
+                style={{
+                  padding: 12, marginBottom: 0, cursor: 'pointer',
+                  border: secili ? '2px solid var(--accent-patron)' : '1px solid var(--border)',
+                  transition: 'border-color 0.15s',
+                }}
+              >
+                <div style={{
+                  width: '100%', height: 110, borderRadius: 8, background: '#F0F2EE',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', marginBottom: 10,
+                }}>
+                  {a.resim_url
+                    ? <img src={a.resim_url} alt={a.plaka} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    : <span style={{ fontSize: 32 }}>ğŸš</span>}
+                </div>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{[a.marka, a.model].filter(Boolean).join(' ') || 'Marka/model girilmedi'}</div>
+                <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 2 }}>{a.plaka}</div>
+                <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span className={'status-tag' + (a.durum === 'BoÅŸta' ? ' open' : '')}>{a.durum}</span>
+                  <span style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{(a.son_km || 0).toLocaleString('tr-TR')} km</span>
+                  {secili && <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-patron)' }}>âœ“ SeÃ§ili</span>}
+                </div>
+              </div>
+            );
+          })}
+          {araclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z araÃ§ eklenmedi.</div>}
+        </div>
+      </div>
+
+      <div className="card" onClick={(e) => e.stopPropagation()}>
+        <div className="grid cols-2">
+          <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
+          <div className="stat-card"><div className="label">Tahmini araÃ§ maliyeti</div><div className="value">{(toplamKm * KM_BIRIM_MALIYET).toLocaleString('tr-TR')} TL</div></div>
+        </div>
+        <h2 className="section" style={{ marginTop: 18 }}>
+          {seciliPlaka ? seciliPlaka + ' â€” kullanÄ±m geÃ§miÅŸi' : 'AraÃ§ kullanÄ±m geÃ§miÅŸi (tÃ¼m araÃ§lar)'}
+        </h2>
+        <div className="grid cols-3" style={{ marginTop: 8 }}>
+          <div>
+            <label>BaÅŸlangÄ±Ã§ tarihi</label>
+            <input type="date" value={baslangicTarih} onChange={(e) => setBaslangicTarih(e.target.value)} />
+          </div>
+          <div>
+            <label>BitiÅŸ tarihi</label>
+            <input type="date" value={bitisTarih} onChange={(e) => setBitisTarih(e.target.value)} />
+          </div>
+          <div>
+            <label>Personel ara</label>
+            <input placeholder="isim yazÄ±n" value={personelArama} onChange={(e) => setPersonelArama(e.target.value)} />
+          </div>
+        </div>
+        <button
+          className="action btn-secondary"
+          disabled={!gosterilenKayitlar.length}
+          onClick={() => excelIndir(
+            gosterilenKayitlar.map((k) => ({
+              Tarih: new Date(k.tarih).toLocaleDateString('tr-TR'), Personel: k.ad, Plaka: k.plaka,
+              'AlÄ±ÅŸ Saati': new Date(k.tarih).toLocaleTimeString('tr-TR'), 'AlÄ±ÅŸ Km': k.alis_km,
+              'Teslim Saati': k.teslim_saati ? new Date(k.teslim_saati).toLocaleTimeString('tr-TR') : '',
+              'Teslim Km': k.teslim_km || '', 'Kat Edilen Km': k.katedilen_km || '', Durum: k.durum,
+            })),
+            'arac-kullanim-gecmisi.xlsx'
+          )}
+        >
+          ğŸ“Š Excel'e Aktar
+        </button>
+        <table>
+          <thead>
+            <tr>
+              <th>Tarih</th><th>Personel</th><th>Plaka</th>
+              <th>AlÄ±ÅŸ saati</th><th>AlÄ±ÅŸ km</th>
+              <th>Teslim saati</th><th>Teslim km</th>
+              <th>SÃ¼re</th><th>Kat edilen</th><th>Durum</th>
+            </tr>
+          </thead>
+          <tbody>
+            {gosterilenKayitlar.map((k) => (
+              <tr key={k.id}>
+                <td>{new Date(k.tarih).toLocaleDateString('tr-TR')}</td>
+                <td>{k.ad}</td>
+                <td>{k.plaka}</td>
+                <td>{new Date(k.tarih).toLocaleTimeString('tr-TR')}</td>
+                <td>{Number(k.alis_km).toLocaleString('tr-TR')}</td>
+                <td>{k.teslim_saati ? new Date(k.teslim_saati).toLocaleTimeString('tr-TR') : 'â€”'}</td>
+                <td>{k.teslim_km ? Number(k.teslim_km).toLocaleString('tr-TR') : 'â€”'}</td>
+                <td>{sureMetni(k.tarih, k.teslim_saati)}</td>
+                <td>{k.katedilen_km ? Number(k.katedilen_km).toLocaleString('tr-TR') + ' km' : 'â€”'}</td>
+                <td><span className={'status-tag' + (k.durum === 'AÃ§Ä±k' ? ' open' : '')}>{k.durum}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- GÃ–REVLER ---------------- */
+function GorevlerTab() {
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [personeller, setPersoneller] = useState([]);
+  const [gorevler, setGorevler] = useState([]);
+  const [durumFiltre, setDurumFiltre] = useState('TÃ¼mÃ¼');
+
+  const [yLokasyon, setYLokasyon] = useState('');
+  const [yBaslik, setYBaslik] = useState('');
+  const [yAciklama, setYAciklama] = useState('');
+  const [yOncelik, setYOncelik] = useState('Normal');
+  const [ySonTarih, setYSonTarih] = useState('');
+  const [ySeciliPersonel, setYSeciliPersonel] = useState([]);
+  const [mesaj, setMesaj] = useState(null);
+  const [ekleniyor, setEkleniyor] = useState(false);
+
+  async function hepsiniYukle() {
+    const { data: l } = await supabase.from('lokasyonlar').select('*');
+    const { data: p } = await supabase.from('personel').select('*').neq('rol', 'patron');
+    const { data: g } = await supabase.from('gorevler').select('*').order('olusturulma_tarihi', { ascending: false });
+    setLokasyonlar(l || []);
+    setPersoneller(p || []);
+    setGorevler(g || []);
+    if (l && l.length && !yLokasyon) setYLokasyon(l[0].ad);
+  }
+
+  useEffect(() => { hepsiniYukle(); }, []); // eslint-disable-line
+
+  function personelSecimiDegistir(no) {
+    setYSeciliPersonel((mevcut) => (mevcut.includes(no) ? mevcut.filter((x) => x !== no) : [...mevcut, no]));
+  }
+
+  async function gorevOlustur() {
+    setMesaj(null);
+    if (!yBaslik.trim() || !yLokasyon) { setMesaj({ tip: 'err', metin: 'BaÅŸlÄ±k ve lokasyon gerekli.' }); return; }
+    if (!ySeciliPersonel.length) { setMesaj({ tip: 'err', metin: 'En az bir personel seÃ§in.' }); return; }
+    setEkleniyor(true);
+    const adlar = ySeciliPersonel.map((no) => personeller.find((p) => p.personel_no === no)?.ad || no);
+    const { error } = await supabase.from('gorevler').insert({
+      lokasyon: yLokasyon, baslik: yBaslik.trim(), aciklama: yAciklama.trim() || null,
+      oncelik: yOncelik, son_tarih: ySonTarih || null,
+      atanan_personel_no: ySeciliPersonel, atanan_adlar: adlar, durum: 'Bekliyor',
+    });
+    setEkleniyor(false);
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+    setMesaj({ tip: 'ok', metin: 'GÃ¶rev oluÅŸturuldu.' });
+    setYBaslik(''); setYAciklama(''); setYOncelik('Normal'); setYSonTarih(''); setYSeciliPersonel([]);
+    hepsiniYukle();
+  }
+
+  async function durumDegistir(gorev, yeniDurum) {
+    await supabase.from('gorevler').update({
+      durum: yeniDurum,
+      tamamlanma_tarihi: yeniDurum === 'TamamlandÄ±' ? new Date().toISOString() : null,
+    }).eq('id', gorev.id);
+    hepsiniYukle();
+  }
+
+  async function gorevSil(id) {
+    if (!confirm('Bu gÃ¶revi silmek istediÄŸine emin misin?')) return;
+    await supabase.from('gorevler').delete().eq('id', id);
+    hepsiniYukle();
+  }
+
+  const gosterilenGorevler = durumFiltre === 'TÃ¼mÃ¼' ? gorevler : gorevler.filter((g) => g.durum === durumFiltre);
+  const oncelikRengi = { 'DÃ¼ÅŸÃ¼k': '#5B6560', 'Normal': '#2B4C5C', 'YÃ¼ksek': '#A0592A', 'Acil': '#B23B0E' };
+
+  return (
+    <div className="grid cols-2">
+      <div className="card">
+        <h2 className="section">Yeni GÃ¶rev OluÅŸtur</h2>
+        <label>Lokasyon</label>
+        <select value={yLokasyon} onChange={(e) => setYLokasyon(e.target.value)}>
+          {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
+        </select>
+        <label>BaÅŸlÄ±k</label>
+        <input value={yBaslik} onChange={(e) => setYBaslik(e.target.value)} placeholder="Ã¶rn. Zemin betonu dÃ¶kÃ¼mÃ¼" />
+        <label>AÃ§Ä±klama</label>
+        <input value={yAciklama} onChange={(e) => setYAciklama(e.target.value)} placeholder="detaylar (opsiyonel)" />
+        <label>Ã–ncelik</label>
+        <select value={yOncelik} onChange={(e) => setYOncelik(e.target.value)}>
+          <option>DÃ¼ÅŸÃ¼k</option><option>Normal</option><option>YÃ¼ksek</option><option>Acil</option>
+        </select>
+        <label>Son tarih</label>
+        <input type="date" value={ySonTarih} onChange={(e) => setYSonTarih(e.target.value)} />
+        <label>Atanacak personel</label>
+        <div className="tag-list">
+          {personeller.map((p) => (
+            <span
+              key={p.personel_no}
+              className={'chip' + (ySeciliPersonel.includes(p.personel_no) ? ' sel' : '')}
+              onClick={() => personelSecimiDegistir(p.personel_no)}
+            >
+              {p.ad}
+            </span>
+          ))}
+          {personeller.length === 0 && <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>HenÃ¼z personel yok.</span>}
+        </div>
+        <button className="action btn-ai" onClick={gorevOlustur} disabled={ekleniyor}>
+          {ekleniyor ? 'OluÅŸturuluyor...' : 'GÃ¶revi OluÅŸtur'}
+        </button>
+        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+      </div>
+
+      <div className="card">
+        <h2 className="section">GÃ¶revler</h2>
+        <label>Durum filtrele</label>
+        <select value={durumFiltre} onChange={(e) => setDurumFiltre(e.target.value)}>
+          <option>TÃ¼mÃ¼</option><option>Bekliyor</option><option>Devam Ediyor</option><option>TamamlandÄ±</option>
+        </select>
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+          {gosterilenGorevler.map((g) => (
+            <div key={g.id} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 8 }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{g.baslik}</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{g.lokasyon} Â· {(g.atanan_adlar || []).join(', ')}</div>
+                  {g.aciklama && <div style={{ fontSize: 13, marginTop: 6 }}>{g.aciklama}</div>}
+                  <div style={{ fontSize: 11, marginTop: 6, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 700, color: oncelikRengi[g.oncelik] || 'var(--ink-soft)' }}>{g.oncelik}</span>
+                    {g.son_tarih && <span style={{ color: 'var(--ink-soft)' }}>Son tarih: {new Date(g.son_tarih).toLocaleDateString('tr-TR')}</span>}
+                    <span className={'status-tag' + (g.durum === 'TamamlandÄ±' ? ' open' : '')}>{g.durum}</span>
+                  </div>
+                </div>
+                <button onClick={() => gorevSil(g.id)} style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '4px 8px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
+              </div>
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                {g.durum !== 'Bekliyor' && <button onClick={() => durumDegistir(g, 'Bekliyor')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'var(--card)', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Bekliyor yap</button>}
+                {g.durum !== 'Devam Ediyor' && <button onClick={() => durumDegistir(g, 'Devam Ediyor')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'var(--card)', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Devam Ediyor yap</button>}
+                {g.durum !== 'TamamlandÄ±' && <button onClick={() => durumDegistir(g, 'TamamlandÄ±')} style={{ fontSize: 11, border: '1px solid var(--border)', background: '#E4F3EA', color: '#2F8F5B', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>TamamlandÄ± yap</button>}
+              </div>
+            </div>
+          ))}
+          {gosterilenGorevler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>GÃ¶sterilecek gÃ¶rev yok.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- PROJELER (mimar planlarÄ± + hata iÅŸaretleme) ---------------- */
+function ProjelerTab() {
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [seciliLokasyon, setSeciliLokasyon] = useState('');
+  const [projeler, setProjeler] = useState([]);
+  const [seciliProje, setSeciliProje] = useState(null);
+  const [notlar, setNotlar] = useState([]);
+  const [yeniBaslik, setYeniBaslik] = useState('');
+  const [yeniDosya, setYeniDosya] = useState(null);
+  const [yukleniyor, setYukleniyor] = useState(false);
+  const [mesaj, setMesaj] = useState(null);
+  const [yeniPin, setYeniPin] = useState(null); // { x, y } â€” henÃ¼z kaydedilmemiÅŸ
+  const [pinMetni, setPinMetni] = useState('');
+  const [acikPin, setAcikPin] = useState(null); // gÃ¶rÃ¼ntÃ¼lenen pin detayÄ±
+  const [pinEklemeModu, setPinEklemeModu] = useState(false);
+
+  useEffect(() => {
+    supabase.from('lokasyonlar').select('*').then(({ data }) => {
+      setLokasyonlar(data || []);
+      if (data && data.length) setSeciliLokasyon(data[0].ad);
+    });
+  }, []);
+
+  async function projeleriYukle() {
+    if (!seciliLokasyon) return;
+    const { data } = await supabase.from('projeler').select('*').eq('lokasyon', seciliLokasyon).order('created_at', { ascending: false });
+    setProjeler(data || []);
+  }
+
+  useEffect(() => { projeleriYukle(); setSeciliProje(null); }, [seciliLokasyon]); // eslint-disable-line
+
+  async function notlariYukle(projeId) {
+    const { data } = await supabase.from('proje_notlari').select('*').eq('proje_id', projeId).order('created_at', { ascending: true });
+    setNotlar(data || []);
+  }
+
+  async function projeSec(p) {
+    setSeciliProje(p);
+    setAcikPin(null);
+    setYeniPin(null);
+    await notlariYukle(p.id);
+  }
+
+  async function projeEkle() {
+    setMesaj(null);
+    if (!yeniBaslik.trim() || !yeniDosya) { setMesaj({ tip: 'err', metin: 'BaÅŸlÄ±k ve resim gerekli.' }); return; }
+    setYukleniyor(true);
+    const dosyaAdi = Date.now() + '-' + yeniDosya.name.replace(/\s+/g, '-');
+    const { error: yuklemeHatasi } = await supabase.storage.from('proje-resimleri').upload(dosyaAdi, yeniDosya);
+    if (yuklemeHatasi) { setMesaj({ tip: 'err', metin: yuklemeHatasi.message }); setYukleniyor(false); return; }
+    const { data: urlData } = supabase.storage.from('proje-resimleri').getPublicUrl(dosyaAdi);
+    const { error } = await supabase.from('projeler').insert({
+      lokasyon: seciliLokasyon, baslik: yeniBaslik.trim(), resim_url: urlData.publicUrl,
+    });
+    setYukleniyor(false);
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+    setMesaj({ tip: 'ok', metin: 'Proje eklendi.' });
+    setYeniBaslik(''); setYeniDosya(null);
+    projeleriYukle();
+  }
+
+  function resmeTiklandi(e) {
+    if (!seciliProje || !pinEklemeModu) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 100;
+    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    setAcikPin(null);
+    setYeniPin({ x, y });
+    setPinMetni('');
+  }
+
+  async function pinKaydet() {
+    if (!pinMetni.trim() || !yeniPin) return;
+    const { error } = await supabase.from('proje_notlari').insert({
+      proje_id: seciliProje.id, x: yeniPin.x, y: yeniPin.y, aciklama: pinMetni.trim(), durum: 'AÃ§Ä±k', olusturan: 'Patron',
+    });
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+    setYeniPin(null); setPinMetni(''); setPinEklemeModu(false);
+    notlariYukle(seciliProje.id);
+  }
+
+  async function pinSil(id) {
+    await supabase.from('proje_notlari').delete().eq('id', id);
+    setAcikPin(null);
+    notlariYukle(seciliProje.id);
+  }
+
+  // --- Proje aÃ§Ä±ksa: plan gÃ¶rÃ¼ntÃ¼leme + iÅŸaretleme ekranÄ± ---
+  if (seciliProje) {
+    return (
+      <div className="card">
+        <style>{`
+          @keyframes pinNabiz { 0% { box-shadow: 0 0 0 0 rgba(220,38,38,0.5); } 70% { box-shadow: 0 0 0 12px rgba(220,38,38,0); } 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0); } }
+          .proje-pin { position: absolute; width: 22px; height: 22px; border-radius: 50%; transform: translate(-50%, -50%); cursor: pointer; border: 2px solid white; }
+          .proje-pin.acik { background: #dc2626; animation: pinNabiz 1.6s infinite; }
+          .proje-pin.cozuldu { background: #16a34a; }
+        `}</style>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+          <button className="action btn-secondary" style={{ width: 'auto' }} onClick={() => setSeciliProje(null)}>â† Projelere dÃ¶n</button>
+          <button
+            className={'action' + (pinEklemeModu ? ' btn-punch cikis' : ' btn-ai')}
+            style={{ width: 'auto' }}
+            onClick={() => { setPinEklemeModu((m) => !m); setYeniPin(null); setAcikPin(null); }}
+          >
+            {pinEklemeModu ? 'âœ• Pin Eklemeyi Ä°ptal Et' : 'ğŸ“ Pin Ekle'}
+          </button>
+        </div>
+        <h2 className="section">{seciliProje.baslik}</h2>
+        <div style={{ fontSize: 13, color: pinEklemeModu ? 'var(--ink)' : 'var(--ink-soft)', marginBottom: 10 }}>
+          {pinEklemeModu ? 'Pin ekleme modu aÃ§Ä±k â€” hatayÄ± iÅŸaretlemek iÃ§in planÄ±n Ã¼zerine tÄ±klayÄ±n.' : '"Pin Ekle" butonuna basÄ±p planda iÅŸaretlemek istediÄŸiniz noktaya tÄ±klayÄ±n.'}
+        </div>
+        <div style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
+          <img
+            src={seciliProje.resim_url}
+            alt={seciliProje.baslik}
+            onClick={resmeTiklandi}
+            style={{ maxWidth: '100%', display: 'block', cursor: pinEklemeModu ? 'crosshair' : 'default', borderRadius: 8 }}
+          />
+          {notlar.map((n) => (
+            <div
+              key={n.id}
+              className={'proje-pin ' + (n.durum === 'AÃ§Ä±k' ? 'acik' : 'cozuldu')}
+              style={{ left: n.x + '%', top: n.y + '%' }}
+              onClick={(e) => { e.stopPropagation(); setYeniPin(null); setAcikPin(n); }}
+            />
+          ))}
+          {yeniPin && <div className="proje-pin acik" style={{ left: yeniPin.x + '%', top: yeniPin.y + '%' }} />}
+        </div>
+
+        {yeniPin && (
+          <div style={{ marginTop: 14 }}>
+            <label>Hata aÃ§Ä±klamasÄ±</label>
+            <input value={pinMetni} onChange={(e) => setPinMetni(e.target.value)} placeholder="Ã¶rn. bu duvarÄ±n Ã¶lÃ§Ã¼sÃ¼ yanlÄ±ÅŸ" />
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button className="action btn-ai" onClick={pinKaydet}>Ä°ÅŸaretle</button>
+              <button className="action btn-secondary" onClick={() => { setYeniPin(null); setPinEklemeModu(false); }}>Ä°ptal</button>
+            </div>
+          </div>
+        )}
+
+        {acikPin && (
+          <div className="card" style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 13, marginBottom: 8 }}>
+              <span className={'status-tag' + (acikPin.durum === 'AÃ§Ä±k' ? ' open' : '')}>{acikPin.durum}</span>
+            </div>
+            <div style={{ marginBottom: 10 }}>{acikPin.aciklama}</div>
+            {acikPin.cozen && <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginBottom: 8 }}>DÃ¼zelten: {acikPin.cozen}</div>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="action btn-secondary" onClick={() => pinSil(acikPin.id)}>Sil</button>
+              <button className="action btn-secondary" onClick={() => setAcikPin(null)}>Kapat</button>
+            </div>
+          </div>
+        )}
+        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+      </div>
+    );
+  }
+
+  // --- Proje seÃ§ilmemiÅŸse: liste + yeni proje ekleme ekranÄ± ---
+  return (
+    <div className="grid cols-2">
+      <div className="card">
+        <h2 className="section">Projeler</h2>
+        <label>Lokasyon</label>
+        <select value={seciliLokasyon} onChange={(e) => setSeciliLokasyon(e.target.value)}>
+          {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
+        </select>
+        {projeler.length === 0 && (
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 10 }}>Bu lokasyonda henÃ¼z proje yok.</div>
+        )}
+        <div style={{ display: 'grid', gap: 10, marginTop: 12 }}>
+          {projeler.map((p) => (
+            <div key={p.id} className="card" style={{ cursor: 'pointer', padding: 10 }} onClick={() => projeSec(p)}>
+              <img src={p.resim_url} alt={p.baslik} style={{ width: '100%', height: 120, objectFit: 'cover', borderRadius: 6 }} />
+              <div style={{ marginTop: 6, fontWeight: 600 }}>{p.baslik}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="card">
+        <h2 className="section">Yeni Proje Ekle</h2>
+        <label>BaÅŸlÄ±k</label>
+        <input value={yeniBaslik} onChange={(e) => setYeniBaslik(e.target.value)} placeholder="Ã¶rn. Zemin kat planÄ±" />
+        <label>Proje / plan resmi</label>
+        <input type="file" accept="image/*" onChange={(e) => setYeniDosya(e.target.files?.[0] || null)} />
+        <button className="action btn-ai" onClick={projeEkle} disabled={yukleniyor}>
+          {yukleniyor ? 'YÃ¼kleniyor...' : 'Projeyi Ekle'}
+        </button>
+        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- TEKLÄ°FLER ---------------- */
+function Teklifler() {
+  const [teklifler, setTeklifler] = useState([]);
+  const [arama, setArama] = useState('');
+
+  useEffect(() => {
+    supabase.from('teklifler').select('*').order('tarih', { ascending: false }).then(({ data }) => setTeklifler(data || []));
+  }, []);
+
+  const gosterilenler = arama.trim()
+    ? teklifler.filter((t) => t.lokasyon.toLocaleLowerCase('tr-TR').includes(arama.trim().toLocaleLowerCase('tr-TR')))
+    : teklifler;
+
+  return (
+    <div className="card">
+      <h2 className="section">GeÃ§miÅŸ Teklifler</h2>
+      <label>Lokasyona gÃ¶re ara</label>
+      <input placeholder="lokasyon adÄ± yazÄ±n" value={arama} onChange={(e) => setArama(e.target.value)} />
+      <button
+        className="action btn-secondary"
+        disabled={!gosterilenler.length}
+        onClick={() => excelIndir(
+          gosterilenler.map((t) => ({ Tarih: new Date(t.tarih).toLocaleString('tr-TR'), Lokasyon: t.lokasyon, 'Toplam Maliyet': t.toplam_maliyet, Durum: t.durum })),
+          'teklifler.xlsx'
+        )}
+      >
+        ğŸ“Š Excel'e Aktar
+      </button>
+      {gosterilenler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13, marginTop: 10 }}>GÃ¶sterilecek teklif yok.</div>}
+      {gosterilenler.map((t) => (
+        <div key={t.id} style={{ borderBottom: '1px solid var(--border)', padding: '10px 0', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+          <span>
+            {new Date(t.tarih).toLocaleString('tr-TR')} Â· {t.lokasyon} Â· {Number(t.toplam_maliyet).toLocaleString('tr-TR')} TL{' '}
+            <span className="status-tag">{t.durum}</span>
+          </span>
+          <button
+            onClick={() => teklifPdfIndir(t)}
+            style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+          >
+            ğŸ“„ PDF Ä°ndir
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- AYARLAR ---------------- */
+function Ayarlar() {
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [kalemTurleri, setKalemTurleri] = useState([]);
+  const [araclar, setAraclar] = useState([]);
+  const [yeniLokasyon, setYeniLokasyon] = useState('');
+  const [yeniEnlem, setYeniEnlem] = useState('');
+  const [yeniBoylam, setYeniBoylam] = useState('');
+  const [yeniYaricap, setYeniYaricap] = useState('150');
+  const [konumAliniyor, setKonumAliniyor] = useState(false);
+  const [gorunenQr, setGorunenQr] = useState(null); // { ad, dataUrl }
+  const [ayarlar, setAyarlar] = useState({ konum_dogrulama_aktif: false, qr_dogrulama_aktif: false, gunluk_rapor_aktif: false, haftalik_rapor_aktif: false, aylik_rapor_aktif: false, rapor_eposta: '' });
+  const [yeniKalem, setYeniKalem] = useState('');
+  const [yeniPlaka, setYeniPlaka] = useState('');
+  const [yeniPlakaKm, setYeniPlakaKm] = useState('');
+  const [yeniMarka, setYeniMarka] = useState('');
+  const [yeniModel, setYeniModel] = useState('');
+  const [yeniResimDosya, setYeniResimDosya] = useState(null);
+  const [ekleniyor, setEkleniyor] = useState(false);
+  const [ypNo, setYpNo] = useState('');
+  const [ypSifre, setYpSifre] = useState('');
+  const [ypAd, setYpAd] = useState('');
+  const [ypRol, setYpRol] = useState('personel');
+  const [ypMesaj, setYpMesaj] = useState(null);
+  const [tumPersonel, setTumPersonel] = useState([]);
+  const [testGonderiliyor, setTestGonderiliyor] = useState(false);
+  const [testMesaj, setTestMesaj] = useState(null);
+  const [duzenlenenKalemId, setDuzenlenenKalemId] = useState(null);
+  const [duzenlenenKalemAd, setDuzenlenenKalemAd] = useState('');
+
+  async function hepsiniYukle() {
+    const { data: l } = await supabase.from('lokasyonlar').select('*');
+    const { data: k } = await supabase.from('kalem_turleri').select('*');
+    const { data: a } = await supabase.from('araclar').select('*');
+    const { data: s } = await supabase.from('sistem_ayarlari').select('*').eq('id', 1).maybeSingle();
+    const { data: p } = await supabase.from('personel').select('*').neq('rol', 'patron').order('ad');
+    setLokasyonlar(l || []);
+    setKalemTurleri(k || []);
+    setAraclar(a || []);
+    if (s) setAyarlar(s);
+    setTumPersonel(p || []);
+  }
+
+  useEffect(() => { hepsiniYukle(); }, []);
+
+  async function ayarGuncelle(alan, deger) {
+    const yeniAyarlar = { ...ayarlar, [alan]: deger };
+    setAyarlar(yeniAyarlar);
+    await supabase.from('sistem_ayarlari').update({ [alan]: deger }).eq('id', 1);
+  }
+
+  async function testEpostasiGonder() {
+    if (!ayarlar.rapor_eposta || !ayarlar.rapor_eposta.trim()) {
+      setTestMesaj({ tip: 'err', metin: 'LÃ¼tfen geÃ§erli bir e-posta adresi girin.' });
+      return;
+    }
+    setTestGonderiliyor(true);
+    setTestMesaj(null);
+    try {
+      const res = await fetch('/api/cron/test-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eposta: ayarlar.rapor_eposta.trim() }),
+      });
+      const data = await res.json();
+      if (data.basari) {
+        setTestMesaj({ tip: 'ok', metin: data.mesaj || 'Test e-postasÄ± baÅŸarÄ±yla gÃ¶nderildi!' });
+      } else {
+        setTestMesaj({ tip: 'err', metin: data.mesaj || 'GÃ¶nderim baÅŸarÄ±sÄ±z.' });
+      }
+    } catch (err) {
+      setTestMesaj({ tip: 'err', metin: 'Ä°stek hatasÄ±: ' + err.message });
+    }
+    setTestGonderiliyor(false);
+  }
+
+  async function suankiKonumuKullan() {
+    setKonumAliniyor(true);
+    try {
+      const { lat, lon } = await konumAl();
+      setYeniEnlem(String(lat));
+      setYeniBoylam(String(lon));
+    } catch (err) {
+      alert(err.message);
+    }
+    setKonumAliniyor(false);
+  }
+
+  async function lokasyonEkle() {
+    if (!yeniLokasyon.trim()) return;
+    const qrKodu = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random();
+    await supabase.from('lokasyonlar').insert({
+      ad: yeniLokasyon.trim(),
+      enlem: yeniEnlem ? Number(yeniEnlem) : null,
+      boylam: yeniBoylam ? Number(yeniBoylam) : null,
+      yaricap_metre: Number(yeniYaricap) || 150,
+      qr_kodu: qrKodu,
+    });
+    setYeniLokasyon(''); setYeniEnlem(''); setYeniBoylam(''); setYeniYaricap('150');
+    hepsiniYukle();
+  }
+
+  async function lokasyonSil(ad) {
+    if (!confirm(ad + ' lokasyonunu silmek istediÄŸine emin misin?')) return;
+    await supabase.from('lokasyonlar').delete().eq('ad', ad);
+    hepsiniYukle();
+  }
+
+  async function qrGoster(lokasyon) {
+    if (!lokasyon.qr_kodu) { alert('Bu lokasyon iÃ§in QR kod tanÄ±mlÄ± deÄŸil.'); return; }
+    const dataUrl = await QRCode.toDataURL(lokasyon.qr_kodu, { width: 260 });
+    setGorunenQr({ ad: lokasyon.ad, dataUrl });
+  }
+
+  async function kalemEkle() {
+    if (!yeniKalem.trim()) return;
+    await supabase.from('kalem_turleri').insert({ ad: yeniKalem.trim() });
+    setYeniKalem('');
+    hepsiniYukle();
+  }
+  async function kalemSil(id, ad) {
+    if (!confirm(ad + ' kalem tÃ¼rÃ¼nÃ¼ silmek istediÄŸine emin misin?')) return;
+    await supabase.from('kalem_turleri').delete().eq('id', id);
+    hepsiniYukle();
+  }
+  async function kalemGuncelle(id) {
+    if (!duzenlenenKalemAd.trim()) return;
+    await supabase.from('kalem_turleri').update({ ad: duzenlenenKalemAd.trim() }).eq('id', id);
+    setDuzenlenenKalemId(null);
+    setDuzenlenenKalemAd('');
+    hepsiniYukle();
+  }
+  async function plakaEkle() {
+    if (!yeniPlaka.trim()) return;
+    setEkleniyor(true);
+
+    let resimUrl = null;
+    if (yeniResimDosya) {
+      const dosyaAdi = Date.now() + '-' + yeniResimDosya.name.replace(/\s+/g, '-');
+      const { error: yuklemeHatasi } = await supabase.storage.from('arac-resimleri').upload(dosyaAdi, yeniResimDosya);
+      if (yuklemeHatasi) {
+        alert('Resim yÃ¼klenemedi: ' + yuklemeHatasi.message);
+        setEkleniyor(false);
+        return;
+      }
+      const { data: urlData } = supabase.storage.from('arac-resimleri').getPublicUrl(dosyaAdi);
+      resimUrl = urlData.publicUrl;
+    }
+
+    await supabase.from('araclar').insert({
+      plaka: yeniPlaka.trim(),
+      durum: 'BoÅŸta',
+      son_km: Number(yeniPlakaKm) || 0,
+      marka: yeniMarka.trim() || null,
+      model: yeniModel.trim() || null,
+      resim_url: resimUrl,
+    });
+    setYeniPlaka(''); setYeniPlakaKm(''); setYeniMarka(''); setYeniModel(''); setYeniResimDosya(null);
+    setEkleniyor(false);
+    hepsiniYukle();
+  }
+  async function plakaSil(plaka, durum) {
+    if (durum === 'KullanÄ±mda') {
+      alert('Bu araÃ§ ÅŸu an kullanÄ±mda, Ã¶nce personel tarafÄ±ndan teslim edilmesi gerekiyor.');
+      return;
+    }
+    if (!confirm(plaka + ' plakalÄ± aracÄ± silmek istediÄŸine emin misin?')) return;
+    await supabase.from('araclar').delete().eq('plaka', plaka);
+    hepsiniYukle();
+  }
+  async function personelEkle() {
+    setYpMesaj(null);
+    if (!ypNo.trim() || !ypSifre.trim() || !ypAd.trim()) { setYpMesaj({ tip: 'err', metin: 'TÃ¼m alanlarÄ± doldurun.' }); return; }
+    const { error } = await supabase.from('personel').insert({
+      personel_no: ypNo.trim(), sifre: ypSifre.trim(), ad: ypAd.trim(), rol: ypRol,
+    });
+    if (error) { setYpMesaj({ tip: 'err', metin: error.message }); return; }
+    setYpMesaj({ tip: 'ok', metin: ypAd + ' eklendi (' + ypNo + ', ' + (ypRol === 'ustabasi' ? 'UstabaÅŸÄ±' : 'Personel') + ').' });
+    setYpNo(''); setYpSifre(''); setYpAd(''); setYpRol('personel');
+    hepsiniYukle();
+  }
+
+  async function rolDegistir(personel_no, yeniRol) {
+    await supabase.from('personel').update({ rol: yeniRol }).eq('personel_no', personel_no);
+    hepsiniYukle();
+  }
+
+  async function personelSil(personel_no, ad) {
+    if (!confirm(ad + ' adlÄ± personeli silmek istediÄŸine emin misin? GeÃ§miÅŸ kayÄ±tlarÄ± (mesai, masraf vb.) etkilenmez.')) return;
+    await supabase.from('personel').delete().eq('personel_no', personel_no);
+    hepsiniYukle();
+  }
+
+  return (
+    <div className="grid cols-2">
+      <div className="card">
+        <h2 className="section">DoÄŸrulama AyarlarÄ±</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 12 }}>
+          AÃ§arsan, personel mesai giriÅŸ/Ã§Ä±kÄ±ÅŸÄ±nda bu doÄŸrulamalarÄ± geÃ§mek zorunda kalÄ±r.
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 14 }}>ğŸ“ Konum doÄŸrulamasÄ±</span>
+          <button
+            onClick={() => ayarGuncelle('konum_dogrulama_aktif', !ayarlar.konum_dogrulama_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.konum_dogrulama_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.konum_dogrulama_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.konum_dogrulama_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0' }}>
+          <span style={{ fontSize: 14 }}>ğŸ“· QR kod doÄŸrulamasÄ±</span>
+          <button
+            onClick={() => ayarGuncelle('qr_dogrulama_aktif', !ayarlar.qr_dogrulama_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.qr_dogrulama_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.qr_dogrulama_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.qr_dogrulama_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2 className="section">E-Posta RaporlarÄ±</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 12 }}>
+          GÃ¼nlÃ¼k ve aylÄ±k Ã¶zet raporlarÄ±nÄ±n gÃ¶nderileceÄŸi e-posta adresini ve durumunu ayarlayÄ±n.
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 13, fontWeight: 'bold' }}>Rapor GÃ¶nderilecek E-posta</label>
+          <input
+            type="email"
+            placeholder="ornek@firma.com"
+            value={ayarlar.rapor_eposta || ''}
+            onChange={(e) => setAyarlar({ ...ayarlar, rapor_eposta: e.target.value })}
+            onBlur={(e) => ayarGuncelle('rapor_eposta', e.target.value.trim())}
+            style={{ marginTop: 6 }}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button
+              onClick={testEpostasiGonder}
+              disabled={testGonderiliyor || !ayarlar.rapor_eposta}
+              className="action btn-secondary"
+              style={{ width: 'auto', fontSize: 12, padding: '6px 12px', height: 'auto', cursor: 'pointer' }}
+            >
+              {testGonderiliyor ? 'GÃ¶nderiliyor...' : 'âš¡ Test E-postasÄ± GÃ¶nder'}
+            </button>
+          </div>
+          {testMesaj && <div className={`feedback ${testMesaj.tip}`} style={{ marginTop: 8, fontSize: 12 }}>{testMesaj.metin}</div>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 14 }}>âœ‰ï¸ GÃ¼nlÃ¼k E-posta Raporu</span>
+          <button
+            onClick={() => ayarGuncelle('gunluk_rapor_aktif', !ayarlar.gunluk_rapor_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.gunluk_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.gunluk_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.gunluk_rapor_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 14 }}>ğŸ“… HaftalÄ±k E-posta Raporu</span>
+          <button
+            onClick={() => ayarGuncelle('haftalik_rapor_aktif', !ayarlar.haftalik_rapor_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.haftalik_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.haftalik_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.haftalik_rapor_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0' }}>
+          <span style={{ fontSize: 14 }}>ğŸ“… AylÄ±k E-posta Raporu</span>
+          <button
+            onClick={() => ayarGuncelle('aylik_rapor_aktif', !ayarlar.aylik_rapor_aktif)}
+            style={{
+              border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              background: ayarlar.aylik_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
+              color: ayarlar.aylik_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+            }}
+          >
+            {ayarlar.aylik_rapor_aktif ? 'Aktif' : 'Pasif'}
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2 className="section">Lokasyonlar</h2>
+        <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+          {lokasyonlar.map((l) => (
+            <div key={l.ad} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ fontSize: 13 }}>
+                  <b>{l.ad}</b> {l.enlem != null ? ' Â· ğŸ“ konum tanÄ±mlÄ±' : ' Â· konum yok'} Â· yarÄ±Ã§ap {l.yaricap_metre || 150} m
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={() => qrGoster(l)} style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>QR</button>
+                  <button onClick={() => lokasyonSil(l.ad)} style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
+                </div>
+              </div>
+            </div>
+          ))}
+          {lokasyonlar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z lokasyon eklenmedi.</div>}
+        </div>
+
+        {gorunenQr && (
+          <div className="card" style={{ marginTop: 12, textAlign: 'center' }}>
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>{gorunenQr.ad}</div>
+            <img src={gorunenQr.dataUrl} alt="QR kod" style={{ width: 180, height: 180, margin: '0 auto' }} />
+            <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'center' }}>
+              <a href={gorunenQr.dataUrl} download={gorunenQr.ad + '-qr.png'} className="action btn-secondary" style={{ width: 'auto', padding: '8px 14px', textDecoration: 'none' }}>Ä°ndir</a>
+              <button className="action btn-secondary" style={{ width: 'auto', padding: '8px 14px' }} onClick={() => setGorunenQr(null)}>Kapat</button>
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: 'grid', gap: 8, marginTop: 14 }}>
+          <input placeholder="Yeni lokasyon adÄ±" value={yeniLokasyon} onChange={(e) => setYeniLokasyon(e.target.value)} />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input placeholder="Enlem (opsiyonel)" value={yeniEnlem} onChange={(e) => setYeniEnlem(e.target.value)} />
+            <input placeholder="Boylam (opsiyonel)" value={yeniBoylam} onChange={(e) => setYeniBoylam(e.target.value)} />
+          </div>
+          <button onClick={suankiKonumuKullan} disabled={konumAliniyor} style={{ border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', borderRadius: 9, padding: '9px 0', fontWeight: 600, cursor: 'pointer', fontSize: 13 }}>
+            {konumAliniyor ? 'Konum alÄ±nÄ±yor...' : 'ğŸ“ Åu Anki Konumu Kullan (sahadayken)'}
+          </button>
+          <input placeholder="Ä°zin verilen yarÄ±Ã§ap (metre)" type="number" value={yeniYaricap} onChange={(e) => setYeniYaricap(e.target.value)} />
+          <button onClick={lokasyonEkle} style={{ border: 'none', background: 'var(--accent-patron)', color: '#fff', borderRadius: 9, padding: '10px 0', fontWeight: 700, cursor: 'pointer' }}>Lokasyon Ekle</button>
+        </div>
+      </div>
+      <div className="card">
+        <h2 className="section">Kalem TÃ¼rleri</h2>
+        <div style={{ display: 'grid', gap: 8, marginTop: 10, marginBottom: 12 }}>
+          {kalemTurleri.map((k) => (
+            <div key={k.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              {duzenlenenKalemId === k.id ? (
+                <div style={{ display: 'flex', gap: 6, width: '100%' }}>
+                  <input
+                    value={duzenlenenKalemAd}
+                    onChange={(e) => setDuzenlenenKalemAd(e.target.value)}
+                    style={{ padding: '5px 8px', fontSize: 13, flex: 1 }}
+                  />
+                  <button
+                    onClick={() => kalemGuncelle(k.id)}
+                    style={{ border: 'none', background: '#E4F3EA', color: '#2F8F5B', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    Kaydet
+                  </button>
+                  <button
+                    onClick={() => { setDuzenlenenKalemId(null); setDuzenlenenKalemAd(''); }}
+                    style={{ border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    Ä°ptal
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>{k.ad}</span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={() => { setDuzenlenenKalemId(k.id); setDuzenlenenKalemAd(k.ad); }}
+                      style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                    >
+                      DÃ¼zenle
+                    </button>
+                    <button
+                      onClick={() => kalemSil(k.id, k.ad)}
+                      style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                    >
+                      Sil
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          ))}
+          {kalemTurleri.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z kalem tÃ¼rÃ¼ eklenmedi.</div>}
+        </div>
+        <div className="add-row">
+          <input placeholder="Yeni kalem tÃ¼rÃ¼" value={yeniKalem} onChange={(e) => setYeniKalem(e.target.value)} />
+          <button onClick={kalemEkle}>Ekle</button>
+        </div>
+      </div>
+      <div className="card">
+        <h2 className="section">AraÃ§ Filosu</h2>
+        <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+          {araclar.map((a) => (
+            <div key={a.plaka} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              <div style={{ fontSize: 13 }}>
+                <b>{a.plaka}</b> Â· {[a.marka, a.model].filter(Boolean).join(' ') || 'marka/model yok'} Â· {a.durum} Â· {(a.son_km || 0).toLocaleString('tr-TR')} km
+              </div>
+              <button
+                onClick={() => plakaSil(a.plaka, a.durum)}
+                style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+              >
+                Sil
+              </button>
+            </div>
+          ))}
+          {araclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z araÃ§ eklenmedi.</div>}
+        </div>
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+          <input placeholder="Plaka (Ã¶rn. 34 AB 123)" value={yeniPlaka} onChange={(e) => setYeniPlaka(e.target.value.toLocaleUpperCase('tr-TR'))} style={{ textTransform: 'uppercase' }} />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input placeholder="Marka (Ã¶rn. Ford)" value={yeniMarka} onChange={(e) => setYeniMarka(e.target.value)} />
+            <input placeholder="Model (Ã¶rn. Transit)" value={yeniModel} onChange={(e) => setYeniModel(e.target.value)} />
+          </div>
+          <input placeholder="BaÅŸlangÄ±Ã§ km" type="number" value={yeniPlakaKm} onChange={(e) => setYeniPlakaKm(e.target.value)} />
+          <label style={{ margin: '2px 0 0' }}>AraÃ§ fotoÄŸrafÄ± (opsiyonel)</label>
+          <input type="file" accept="image/*" onChange={(e) => setYeniResimDosya(e.target.files?.[0] || null)} />
+          <button onClick={plakaEkle} disabled={ekleniyor} style={{ border: 'none', background: 'var(--accent-patron)', color: '#fff', borderRadius: 9, padding: '10px 0', fontWeight: 700, cursor: 'pointer' }}>
+            {ekleniyor ? 'Ekleniyor...' : 'AracÄ± Ekle'}
+          </button>
+        </div>
+      </div>
+      <div className="card">
+        <h2 className="section">Personel YÃ¶netimi</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 10 }}>
+          Sadece <b>UstabaÅŸÄ±</b> rolÃ¼ndeki kiÅŸiler Saha Verisi (masraf) girebilir. Personel rolÃ¼ bu ekrana eriÅŸemez.
+        </div>
+        <div style={{ display: 'grid', gap: 8 }}>
+          {tumPersonel.map((p) => (
+            <div key={p.personel_no} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: '8px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ fontSize: 13 }}>
+                  <b>{p.ad}</b> Â· {p.personel_no}
+                </div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <select
+                    value={p.rol}
+                    onChange={(e) => rolDegistir(p.personel_no, e.target.value)}
+                    style={{ padding: '5px 8px', fontSize: 12, width: 'auto' }}
+                  >
+                    <option value="personel">Personel</option>
+                    <option value="ustabasi">UstabaÅŸÄ±</option>
+                  </select>
+                  <button
+                    onClick={() => personelSil(p.personel_no, p.ad)}
+                    style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    Sil
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+          {tumPersonel.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z personel eklenmedi.</div>}
+        </div>
+
+        <h2 className="section" style={{ marginTop: 18 }}>Yeni Personel Ekle</h2>
+        <label>KullanÄ±cÄ± adÄ±</label><input value={ypNo} onChange={(e) => setYpNo(e.target.value)} placeholder="Ã¶rn. mehmet.sahin veya 1001" />
+        <label>Åifre</label><input value={ypSifre} onChange={(e) => setYpSifre(e.target.value)} placeholder="1234" />
+        <label>Ad Soyad</label><input value={ypAd} onChange={(e) => setYpAd(e.target.value)} placeholder="Ad Soyad" />
+        <label>Rol</label>
+        <select value={ypRol} onChange={(e) => setYpRol(e.target.value)}>
+          <option value="personel">Personel</option>
+          <option value="ustabasi">UstabaÅŸÄ±</option>
+        </select>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>
+          Lokasyon burada seÃ§ilmiyor â€” kiÅŸi ilk mesai giriÅŸinde kendi lokasyonunu seÃ§ecek.
+        </div>
+        <button className="action btn-ai" onClick={personelEkle}>Personel Ekle</button>
+        {ypMesaj && <div className={'feedback ' + ypMesaj.tip}>{ypMesaj.metin}</div>}
+      </div>
+    </div>
+  );
+}
+
+
+===== app\personel\page.js =====
+// Bu dosya, personel panelinizdeki (Ã¶rn. app/personel/page.js) TÃœM Ä°Ã‡ERÄ°ÄÄ°N
+// yerine geÃ§ecek gÃ¼ncellenmiÅŸ halidir. AÅŸaÄŸÄ±daki 4 parÃ§a birbirine baÄŸlÄ±
+// Ã§alÄ±ÅŸtÄ±ÄŸÄ± iÃ§in hepsini birlikte, olduÄŸu gibi kopyalayÄ±n.
+//
+// Ã–NEMLÄ°: Bu dosyayÄ± kullanmadan Ã¶nce Supabase'de migration-lokasyon-ekle.sql
+// (giris_cikis'e lokasyon sÃ¼tunu) VE migration-son-km.sql (araclar'a son_km
+// sÃ¼tunu) dosyalarÄ±nÄ±n ikisinin de Ã§alÄ±ÅŸtÄ±rÄ±lmÄ±ÅŸ olmasÄ± gerekiyor.
+
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabase';
+import { getInitialTheme, temaUygula, temaDegistir } from '@/lib/theme';
+import { konumAl, mesafeMetre } from '@/lib/geo';
+import QrOkuyucu from '@/components/QrOkuyucu';
+
+// OndalÄ±k saat deÄŸerini (Ã¶rn. 0.03) "1 dk" veya "1 sa 48 dk" gibi okunabilir metne Ã§evirir.
+function sureFormatla(saatOndalik) {
+  const toplamDakika = Math.round((Number(saatOndalik) || 0) * 60);
+  const saat = Math.floor(toplamDakika / 60);
+  const dakika = toplamDakika % 60;
+  if (saat === 0) return dakika + ' dk';
+  if (dakika === 0) return saat + ' sa';
+  return saat + ' sa ' + dakika + ' dk';
+}
+
+export default function PersonelPanel() {
+  const router = useRouter();
+  const [oturum, setOturum] = useState(null);
+  const [tab, setTab] = useState('mesai');
+  const [saat, setSaat] = useState('');
+  const [tarihMetni, setTarihMetni] = useState('');
+  const [aktifLokasyon, setAktifLokasyon] = useState(null); // o gÃ¼nkÃ¼ seÃ§ilen lokasyon
+  const [tema, setTema] = useState('light');
+
+  useEffect(() => {
+    const kayit = localStorage.getItem('aktifOturum');
+    if (!kayit) { router.push('/'); return; }
+    const parsed = JSON.parse(kayit);
+    if (parsed.rol !== 'personel' && parsed.rol !== 'ustabasi') { router.push('/'); return; }
+    setOturum(parsed);
+  }, [router]);
+
+  useEffect(() => {
+    const t = getInitialTheme();
+    setTema(t);
+    temaUygula(t);
+  }, []);
+
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      setSaat(now.toLocaleTimeString('tr-TR'));
+      setTarihMetni(now.toLocaleDateString('tr-TR', { weekday: 'long', day: 'numeric', month: 'long' }));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  function cikisYapOturum() {
+    localStorage.removeItem('aktifOturum');
+    router.push('/');
+  }
+
+  if (!oturum) return null;
+
+  return (
+    <div>
+      <div className="app-header">
+        <span className="brand">Saha Takip</span>
+        <span className="who">Merhaba, <b>{oturum.ad}</b> {oturum.rol === 'ustabasi' && '(UstabaÅŸÄ±)'}</span>
+        <div>
+          <button className="theme-toggle" onClick={() => setTema(temaDegistir(tema))}>{tema === 'dark' ? 'â˜€ï¸' : 'ğŸŒ™'}</button>
+          <button className="logout" onClick={cikisYapOturum}>Ã‡Ä±kÄ±ÅŸ</button>
+        </div>
+      </div>
+      <div className="tabbar">
+        <button className={tab === 'mesai' ? 'active-personel' : ''} onClick={() => setTab('mesai')}>Mesai</button>
+        <button className={tab === 'saatler' ? 'active-personel' : ''} onClick={() => setTab('saatler')}>Ã‡alÄ±ÅŸma Saatlerim</button>
+        <button className={tab === 'gorevler' ? 'active-personel' : ''} onClick={() => setTab('gorevler')}>GÃ¶revlerim</button>
+        <button className={tab === 'arac' ? 'active-personel' : ''} onClick={() => setTab('arac')}>AraÃ§</button>
+        {oturum.rol === 'ustabasi' && (
+          <button className={tab === 'veri' ? 'active-personel' : ''} onClick={() => setTab('veri')}>Saha Verisi</button>
+        )}
+      </div>
+      <div className="content">
+        {tab === 'mesai' && (
+          <MesaiTab
+            oturum={oturum}
+            saat={saat}
+            tarihMetni={tarihMetni}
+            lokasyonAyarlandi={setAktifLokasyon}
+          />
+        )}
+        {tab === 'saatler' && <SaatlerimTab oturum={oturum} />}
+        {tab === 'gorevler' && <GorevlerimTab oturum={oturum} />}
+        {tab === 'arac' && <AracTab oturum={oturum} />}
+        {tab === 'veri' && oturum.rol === 'ustabasi' && <VeriTab oturum={oturum} aktifLokasyon={aktifLokasyon} />}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- MESAÄ° ---------------- */
+function MesaiTab({ oturum, saat, tarihMetni, lokasyonAyarlandi }) {
+  const [acikKayit, setAcikKayit] = useState(null);
+  const [yukleniyor, setYukleniyor] = useState(true);
+  const [mesaj, setMesaj] = useState(null);
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [seciliLokasyon, setSeciliLokasyon] = useState('');
+  const [ayarlar, setAyarlar] = useState({ konum_dogrulama_aktif: false, qr_dogrulama_aktif: false });
+
+  const [konumDurum, setKonumDurum] = useState('bekliyor'); // bekliyor | kontrol | basarili | basarisiz
+  const [konumMesaj, setKonumMesaj] = useState('');
+  const [qrDurum, setQrDurum] = useState('bekliyor'); // bekliyor | tariyor | basarili | basarisiz
+  const [qrMesaj, setQrMesaj] = useState('');
+
+  useEffect(() => {
+    supabase.from('lokasyonlar').select('*').then(({ data }) => {
+      setLokasyonlar(data || []);
+      if (data && data.length) setSeciliLokasyon(data[0].ad);
+    });
+    supabase.from('sistem_ayarlari').select('*').eq('id', 1).maybeSingle().then(({ data }) => {
+      if (data) setAyarlar(data);
+    });
+  }, []);
+
+  async function durumYukle() {
+    setYukleniyor(true);
+    const { data } = await supabase
+      .from('giris_cikis')
+      .select('*')
+      .eq('personel_no', oturum.personel_no)
+      .order('giris_saati', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const acikMi = !!(data && data.durum === 'AÃ§Ä±k');
+    setAcikKayit(acikMi ? data : null);
+    lokasyonAyarlandi(data ? data.lokasyon : null);
+    setYukleniyor(false);
+    konumSifirla();
+  }
+
+  useEffect(() => { durumYukle(); }, []); // eslint-disable-line
+
+  function konumSifirla() {
+    setKonumDurum('bekliyor'); setKonumMesaj('');
+    setQrDurum('bekliyor'); setQrMesaj('');
+  }
+  useEffect(() => { konumSifirla(); }, [seciliLokasyon]);
+
+  // Åu an doÄŸrulanmasÄ± gereken lokasyon: giriÅŸ yapÄ±lÄ±yorsa seÃ§ilen, Ã§Ä±kÄ±ÅŸ yapÄ±lÄ±yorsa aktif kayÄ±ttaki lokasyon.
+  const hedefLokasyon = acikKayit
+    ? lokasyonlar.find((l) => l.ad === acikKayit.lokasyon)
+    : lokasyonlar.find((l) => l.ad === seciliLokasyon);
+
+  async function konumDogrula() {
+    setKonumDurum('kontrol'); setKonumMesaj('');
+    if (!hedefLokasyon || hedefLokasyon.enlem == null || hedefLokasyon.boylam == null) {
+      setKonumDurum('basarisiz');
+      setKonumMesaj('Bu lokasyon iÃ§in konum bilgisi tanÄ±mlanmamÄ±ÅŸ. Patronunuzla iletiÅŸime geÃ§in.');
+      return;
+    }
+    try {
+      const { lat, lon } = await konumAl();
+      const mesafe = mesafeMetre(lat, lon, hedefLokasyon.enlem, hedefLokasyon.boylam);
+      const izinliMesafe = hedefLokasyon.yaricap_metre || 150;
+      if (mesafe <= izinliMesafe) {
+        setKonumDurum('basarili');
+        setKonumMesaj('Konum doÄŸrulandÄ± (yaklaÅŸÄ±k ' + mesafe + ' m).');
+      } else {
+        setKonumDurum('basarisiz');
+        setKonumMesaj('Sahada deÄŸilsiniz. Lokasyona ' + mesafe + ' m uzaktasÄ±nÄ±z (izin verilen: ' + izinliMesafe + ' m).');
+      }
+    } catch (err) {
+      setKonumDurum('basarisiz');
+      setKonumMesaj(err.message);
+    }
+  }
+
+  function qrOkundu(kod) {
+    // QR aktifken giriÅŸ yapÄ±lÄ±yorsa: lokasyon QR'dan otomatik belirlenir
+    if (ayarlar.qr_dogrulama_aktif && !acikKayit) {
+      const bulunanLokasyon = lokasyonlar.find((l) => l.qr_kodu === kod);
+      if (bulunanLokasyon) {
+        setSeciliLokasyon(bulunanLokasyon.ad);
+        setQrDurum('basarili');
+        setQrMesaj('QR kod doÄŸrulandÄ±. Lokasyon: ' + bulunanLokasyon.ad);
+      } else {
+        setQrDurum('basarisiz');
+        setQrMesaj('Bu QR kod tanÄ±mlÄ± bir lokasyona ait deÄŸil.');
+      }
+    } else if (hedefLokasyon && kod === hedefLokasyon.qr_kodu) {
+      setQrDurum('basarili');
+      setQrMesaj('QR kod doÄŸrulandÄ±.');
+    } else {
+      setQrDurum('basarisiz');
+      setQrMesaj('Bu QR kod bu lokasyona ait deÄŸil.');
+    }
+  }
+
+  const dogrulamaGerekli = ayarlar.konum_dogrulama_aktif || ayarlar.qr_dogrulama_aktif;
+  const dogrulamaTamam =
+    (!ayarlar.konum_dogrulama_aktif || konumDurum === 'basarili') &&
+    (!ayarlar.qr_dogrulama_aktif || qrDurum === 'basarili');
+
+  async function girisYap() {
+    setMesaj(null);
+    if (!seciliLokasyon) { setMesaj({ tip: 'err', metin: 'LÃ¼tfen bugÃ¼nkÃ¼ lokasyonunuzu seÃ§in.' }); return; }
+    if (dogrulamaGerekli && !dogrulamaTamam) { setMesaj({ tip: 'err', metin: 'Ã–nce konum/QR doÄŸrulamasÄ±nÄ± tamamlayÄ±n.' }); return; }
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('giris_cikis').insert({
+      personel_no: oturum.personel_no,
+      ad: oturum.ad,
+      giris_saati: now,
+      durum: 'AÃ§Ä±k',
+      lokasyon: seciliLokasyon,
+    });
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+    setMesaj({ tip: 'ok', metin: 'GiriÅŸ kaydedildi: ' + new Date().toLocaleTimeString('tr-TR') });
+    durumYukle();
+  }
+
+  async function cikisYap() {
+    setMesaj(null);
+    if (dogrulamaGerekli && !dogrulamaTamam) { setMesaj({ tip: 'err', metin: 'Ã–nce konum/QR doÄŸrulamasÄ±nÄ± tamamlayÄ±n.' }); return; }
+    const now = new Date();
+    const girisSaati = new Date(acikKayit.giris_saati);
+    const hamSure = (now - girisSaati) / 3600000;
+    const sureSaat = Math.round(Math.max(hamSure - 1, 0) * 100) / 100; // 1 saatlik mola otomatik dÃ¼ÅŸÃ¼lÃ¼r
+    const { error } = await supabase
+      .from('giris_cikis')
+      .update({ cikis_saati: now.toISOString(), sure_saat: sureSaat, durum: 'KapalÄ±' })
+      .eq('id', acikKayit.id);
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+    setMesaj({ tip: 'ok', metin: 'Ã‡Ä±kÄ±ÅŸ kaydedildi. SÃ¼re: ' + sureFormatla(sureSaat) + ' (1 saatlik mola dÃ¼ÅŸÃ¼ldÃ¼)' });
+    durumYukle();
+  }
+
+  const icerde = !!acikKayit;
+
+  return (
+    <>
+      <div className="clock">{saat || '--:--:--'}</div>
+      <div className="date-label">{tarihMetni}</div>
+      <div className="card">
+        <h2 className="section">Mesai</h2>
+
+        {icerde ? (
+          <div className="loc-badge">
+            <div>
+              <div className="label">BugÃ¼nkÃ¼ lokasyon</div>
+              <div className="value">{acikKayit.lokasyon || 'â€”'}</div>
+            </div>
+          </div>
+        ) : ayarlar.qr_dogrulama_aktif ? (
+          <div className="loc-badge">
+            <div>
+              <div className="label">{seciliLokasyon ? 'QR ile belirlenen lokasyon' : 'Lokasyon QR okutunca belirlenecek'}</div>
+              {seciliLokasyon && <div className="value">{seciliLokasyon}</div>}
+            </div>
+          </div>
+        ) : (
+          <>
+            <label>BugÃ¼n hangi lokasyondasÄ±nÄ±z?</label>
+            <select value={seciliLokasyon} onChange={(e) => setSeciliLokasyon(e.target.value)}>
+              {lokasyonlar.length === 0 && <option value="">HenÃ¼z lokasyon tanÄ±mlÄ± deÄŸil</option>}
+              {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
+            </select>
+          </>
+        )}
+
+        <div className="status-row">
+          <span className={'dot ' + (icerde ? 'icerde' : 'disarda')}></span>
+          <span>{yukleniyor ? 'durum kontrol ediliyor' : (oturum.ad + (icerde ? ' ÅŸu an iÃ§eride' : ' ÅŸu an dÄ±ÅŸarÄ±da'))}</span>
+        </div>
+
+        {dogrulamaGerekli && !yukleniyor && (
+          <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            {ayarlar.konum_dogrulama_aktif && (
+              <div style={{ marginBottom: 10 }}>
+                {konumDurum !== 'basarili' && (
+                  <button className="action btn-secondary" onClick={konumDogrula} disabled={konumDurum === 'kontrol'}>
+                    {konumDurum === 'kontrol' ? 'ğŸ“ Konum kontrol ediliyor...' : 'ğŸ“ Konumu DoÄŸrula'}
+                  </button>
+                )}
+                {konumDurum === 'basarili' && <div className="feedback ok">âœ… {konumMesaj}</div>}
+                {konumDurum === 'basarisiz' && <div className="feedback err">{konumMesaj}</div>}
+              </div>
+            )}
+            {ayarlar.qr_dogrulama_aktif && (
+              <div>
+                {qrDurum !== 'basarili' && qrDurum !== 'tariyor' && (
+                  <button className="action btn-secondary" onClick={() => setQrDurum('tariyor')}>ğŸ“· QR Kodu Okut</button>
+                )}
+                {qrDurum === 'tariyor' && (
+                  <QrOkuyucu
+                    onOkundu={qrOkundu}
+                    onIptal={(hata) => { setQrDurum('bekliyor'); if (hata) setQrMesaj(hata); }}
+                  />
+                )}
+                {qrDurum === 'basarili' && <div className="feedback ok">âœ… {qrMesaj}</div>}
+                {qrDurum === 'basarisiz' && <div className="feedback err">{qrMesaj}</div>}
+              </div>
+            )}
+          </div>
+        )}
+
+        <button
+          className={'action btn-punch' + (icerde ? ' cikis' : '')}
+          onClick={icerde ? cikisYap : girisYap}
+          disabled={yukleniyor || (!icerde && !lokasyonlar.length) || (dogrulamaGerekli && !dogrulamaTamam)}
+        >
+          {icerde ? 'Ã‡Ä±kÄ±ÅŸ Yap' : 'GiriÅŸ Yap'}
+        </button>
+        {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+      </div>
+    </>
+  );
+}
+
+/* ---------------- Ã‡ALIÅMA SAATLERÄ°M (gÃ¼n/hafta/ay, 1 saat mola dahil) ---------------- */
+function SaatlerimTab({ oturum }) {
+  const [yukleniyor, setYukleniyor] = useState(true);
+  const [bugun, setBugun] = useState(0);
+  const [haftalik, setHaftalik] = useState(0);
+  const [aylik, setAylik] = useState(0);
+  const [gecmis, setGecmis] = useState([]);
+
+  useEffect(() => {
+    (async () => {
+      setYukleniyor(true);
+      const { data } = await supabase
+        .from('giris_cikis')
+        .select('*')
+        .eq('personel_no', oturum.personel_no)
+        .eq('durum', 'KapalÄ±')
+        .order('giris_saati', { ascending: false });
+
+      const kayitlar = data || [];
+      const now = new Date();
+      const bugunBaslangic = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const haftaBaslangic = new Date(now);
+      haftaBaslangic.setDate(now.getDate() - 7);
+      const ayBaslangic = new Date(now.getFullYear(), now.getMonth(), 1);
+
+      let g = 0, h = 0, a = 0;
+      kayitlar.forEach((k) => {
+        const tarih = new Date(k.giris_saati);
+        const sure = Number(k.sure_saat) || 0;
+        if (tarih >= bugunBaslangic) g += sure;
+        if (tarih >= haftaBaslangic) h += sure;
+        if (tarih >= ayBaslangic) a += sure;
+      });
+
+      setBugun(Math.round(g * 100) / 100);
+      setHaftalik(Math.round(h * 100) / 100);
+      setAylik(Math.round(a * 100) / 100);
+      setGecmis(kayitlar.slice(0, 15));
+      setYukleniyor(false);
+    })();
+  }, [oturum.personel_no]);
+
+  if (yukleniyor) return <div className="loading-text">YÃ¼kleniyor...</div>;
+
+  return (
+    <>
+      <div className="grid cols-3">
+        <div className="stat-card"><div className="label">BugÃ¼n</div><div className="value">{sureFormatla(bugun)}</div></div>
+        <div className="stat-card"><div className="label">Bu hafta</div><div className="value">{sureFormatla(haftalik)}</div></div>
+        <div className="stat-card"><div className="label">Bu ay</div><div className="value">{sureFormatla(aylik)}</div></div>
+      </div>
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2 className="section">Son mesai kayÄ±tlarÄ±</h2>
+        <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginBottom: 8 }}>SÃ¼reler, her mesaideki 1 saatlik mola dÃ¼ÅŸÃ¼lerek hesaplanmÄ±ÅŸtÄ±r.</div>
+        <table>
+          <thead><tr><th>Tarih</th><th>GiriÅŸ</th><th>Ã‡Ä±kÄ±ÅŸ</th><th>SÃ¼re</th></tr></thead>
+          <tbody>
+            {gecmis.map((k) => (
+              <tr key={k.id}>
+                <td>{new Date(k.giris_saati).toLocaleDateString('tr-TR')}</td>
+                <td>{new Date(k.giris_saati).toLocaleTimeString('tr-TR')}</td>
+                <td>{k.cikis_saati ? new Date(k.cikis_saati).toLocaleTimeString('tr-TR') : 'â€”'}</td>
+                <td>{k.sure_saat ? sureFormatla(k.sure_saat) : 'â€”'}</td>
+              </tr>
+            ))}
+            {gecmis.length === 0 && <tr><td colSpan={4}>HenÃ¼z tamamlanmÄ±ÅŸ mesai kaydÄ±n yok.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+/* ---------------- GÃ–REVLERÄ°M ---------------- */
+function GorevlerimTab({ oturum }) {
+  const [gorevler, setGorevler] = useState([]);
+  const [yukleniyor, setYukleniyor] = useState(true);
+  const [durumFiltre, setDurumFiltre] = useState('TÃ¼mÃ¼');
+  const [fotoYukleniyor, setFotoYukleniyor] = useState(null); // yÃ¼klenen gÃ¶revin id'si
+
+  async function yukle() {
+    setYukleniyor(true);
+    const { data } = await supabase
+      .from('gorevler')
+      .select('*')
+      .contains('atanan_personel_no', [oturum.personel_no])
+      .order('olusturulma_tarihi', { ascending: false });
+    setGorevler(data || []);
+    setYukleniyor(false);
+  }
+
+  useEffect(() => { yukle(); }, [oturum.personel_no]); // eslint-disable-line
+
+  // Bildirim izni iste + Realtime subscription
+  useEffect(() => {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    const kanal = supabase
+      .channel('gorev-bildirim-' + oturum.personel_no)
+      .on('postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'gorevler' },
+        (payload) => {
+          const yeni = payload.new;
+          if (Array.isArray(yeni.atanan_personel_no) && yeni.atanan_personel_no.includes(oturum.personel_no)) {
+            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+              new Notification('ğŸ“‹ Yeni GÃ¶rev AtandÄ±!', {
+                body: yeni.baslik + (yeni.lokasyon ? ' â€” ' + yeni.lokasyon : ''),
+                icon: '/favicon.ico',
+              });
+            }
+            yukle();
+          }
+        }
+      )
+      .subscribe();
+
+    return () => { supabase.removeChannel(kanal); };
+  }, [oturum.personel_no]); // eslint-disable-line
+
+  async function durumDegistir(gorev, yeniDurum) {
+    await supabase.from('gorevler').update({
+      durum: yeniDurum,
+      tamamlanma_tarihi: yeniDurum === 'TamamlandÄ±' ? new Date().toISOString() : null,
+    }).eq('id', gorev.id);
+    yukle();
+  }
+
+  async function fotoSecildiVeTamamlandi(e, gorev) {
+    const dosya = e.target.files?.[0];
+    e.target.value = '';
+    if (!dosya || !gorev) return;
+    setFotoYukleniyor(gorev.id);
+    const dosyaAdi = Date.now() + '-' + dosya.name.replace(/\s+/g, '-');
+    const { error: yuklemeHatasi } = await supabase.storage.from('gorev-fotolari').upload(dosyaAdi, dosya);
+    if (yuklemeHatasi) {
+      alert('FotoÄŸraf yÃ¼klenemedi: ' + yuklemeHatasi.message);
+      setFotoYukleniyor(null);
+      return;
+    }
+    const { data: urlData } = supabase.storage.from('gorev-fotolari').getPublicUrl(dosyaAdi);
+    await supabase.from('gorevler').update({
+      durum: 'TamamlandÄ±',
+      tamamlanma_tarihi: new Date().toISOString(),
+      tamamlanma_foto_url: urlData.publicUrl,
+    }).eq('id', gorev.id);
+    setFotoYukleniyor(null);
+    yukle();
+  }
+
+  if (yukleniyor) return <div className="loading-text">YÃ¼kleniyor...</div>;
+
+  const gosterilenler = durumFiltre === 'TÃ¼mÃ¼' ? gorevler : gorevler.filter((g) => g.durum === durumFiltre);
+  const oncelikRengi = { 'DÃ¼ÅŸÃ¼k': '#5B6560', 'Normal': '#E8590C', 'YÃ¼ksek': '#A0592A', 'Acil': '#B23B0E' };
+
+  return (
+    <div className="card">
+      <h2 className="section">GÃ¶revlerim</h2>
+      <label>Durum filtrele</label>
+      <select value={durumFiltre} onChange={(e) => setDurumFiltre(e.target.value)}>
+        <option>TÃ¼mÃ¼</option><option>Bekliyor</option><option>Devam Ediyor</option><option>TamamlandÄ±</option>
+      </select>
+      <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+        {gosterilenler.map((g) => (
+          <div key={g.id} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: 10 }}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>{g.baslik}</div>
+            <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{g.lokasyon}</div>
+            {g.aciklama && <div style={{ fontSize: 13, marginTop: 6 }}>{g.aciklama}</div>}
+            <div style={{ fontSize: 11, marginTop: 6, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 700, color: oncelikRengi[g.oncelik] || 'var(--ink-soft)' }}>{g.oncelik}</span>
+              {g.son_tarih && <span style={{ color: 'var(--ink-soft)' }}>Son tarih: {new Date(g.son_tarih).toLocaleDateString('tr-TR')}</span>}
+              <span className={'status-tag' + (g.durum === 'TamamlandÄ±' ? ' open' : '')}>{g.durum}</span>
+            </div>
+            {g.tamamlanma_foto_url && (
+              <a href={g.tamamlanma_foto_url} target="_blank" rel="noreferrer" style={{ display: 'inline-block', marginTop: 8 }}>
+                <img src={g.tamamlanma_foto_url} alt="Tamamlanma fotoÄŸrafÄ±" style={{ width: 70, height: 70, objectFit: 'cover', borderRadius: 6 }} />
+              </a>
+            )}
+            <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              {g.durum === 'Bekliyor' && (
+                <button onClick={() => durumDegistir(g, 'Devam Ediyor')} className="action btn-secondary" style={{ width: 'auto', padding: '7px 12px', fontSize: 12, marginTop: 0 }}>BaÅŸladÄ±m</button>
+              )}
+              {g.durum !== 'TamamlandÄ±' && (
+                <>
+                  {/* Her kart kendi input'unu yÃ¶netiyor â€” click() doÄŸrudan user event'ten Ã§aÄŸrÄ±lÄ±r */}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    style={{ display: 'none' }}
+                    id={'foto-input-' + g.id}
+                    onChange={(e) => fotoSecildiVeTamamlandi(e, g)}
+                  />
+                  <button
+                    onClick={() => document.getElementById('foto-input-' + g.id)?.click()}
+                    className="action btn-punch"
+                    style={{ width: 'auto', padding: '7px 12px', fontSize: 12, marginTop: 0 }}
+                    disabled={fotoYukleniyor === g.id}
+                  >
+                    {fotoYukleniyor === g.id ? 'YÃ¼kleniyor...' : 'ğŸ“· FotoÄŸrafla Tamamla'}
+                  </button>
+                </>
+              )}
+              {g.durum === 'TamamlandÄ±' && (
+                <button onClick={() => durumDegistir(g, 'Devam Ediyor')} className="action btn-secondary" style={{ width: 'auto', padding: '7px 12px', fontSize: 12, marginTop: 0 }}>Geri al</button>
+              )}
+            </div>
+          </div>
+        ))}
+        {gosterilenler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Size atanmÄ±ÅŸ gÃ¶rev yok.</div>}
+      </div>
+    </div>
+  );
+}
+
+
+
+/* ---------------- ARAÃ‡ (km kilitli + gecmis kullanim listesi) ---------------- */
+function AracTab({ oturum }) {
+  const [acikKayit, setAcikKayit] = useState(null);
+  const [bostaAraclar, setBostaAraclar] = useState([]);
+  const [tumAraclar, setTumAraclar] = useState([]);
+  const [gecmis, setGecmis] = useState([]);
+  const [plaka, setPlaka] = useState('');
+  const [alisKm, setAlisKm] = useState('');
+  const [teslimKm, setTeslimKm] = useState('');
+  const [mesaj, setMesaj] = useState(null);
+  const [yukleniyor, setYukleniyor] = useState(true);
+
+  async function veriYukle() {
+    setYukleniyor(true);
+    const { data: acik } = await supabase
+      .from('arac_kullanim')
+      .select('*')
+      .eq('personel_no', oturum.personel_no)
+      .eq('durum', 'AÃ§Ä±k')
+      .maybeSingle();
+    setAcikKayit(acik || null);
+
+    if (!acik) {
+      const { data: bosta } = await supabase.from('araclar').select('*').eq('durum', 'BoÅŸta');
+      setBostaAraclar(bosta || []);
+      if (bosta && bosta.length) {
+        setPlaka(bosta[0].plaka);
+        setAlisKm(bosta[0].son_km != null ? String(bosta[0].son_km) : '');
+      }
+    }
+
+    const { data: hepsi } = await supabase.from('araclar').select('*');
+    setTumAraclar(hepsi || []);
+
+    const { data: gecmisVeri } = await supabase
+      .from('arac_kullanim')
+      .select('*')
+      .eq('personel_no', oturum.personel_no)
+      .eq('durum', 'KapalÄ±')
+      .order('tarih', { ascending: false })
+      .limit(10);
+    setGecmis(gecmisVeri || []);
+
+    setYukleniyor(false);
+  }
+
+  useEffect(() => { veriYukle(); }, []); // eslint-disable-line
+
+  function plakaDegisti(yeniPlaka) {
+    setPlaka(yeniPlaka);
+    const arac = bostaAraclar.find((a) => a.plaka === yeniPlaka);
+    setAlisKm(arac && arac.son_km != null ? String(arac.son_km) : '');
+  }
+
+  async function teslimAl() {
+    setMesaj(null);
+    if (!plaka || alisKm === '') { setMesaj({ tip: 'err', metin: 'Plaka ve alÄ±ÅŸ kilometresi gerekli.' }); return; }
+    const { error: e1 } = await supabase.from('arac_kullanim').insert({
+      personel_no: oturum.personel_no, ad: oturum.ad, plaka, alis_km: Number(alisKm), durum: 'AÃ§Ä±k',
+    });
+    if (e1) { setMesaj({ tip: 'err', metin: e1.message }); return; }
+    await supabase.from('araclar').update({ durum: 'KullanÄ±mda' }).eq('plaka', plaka);
+    setMesaj({ tip: 'ok', metin: plaka + ' teslim alÄ±ndÄ±.' });
+    setAlisKm('');
+    veriYukle();
+  }
+
+  async function teslimEt() {
+    setMesaj(null);
+    const t = Number(teslimKm);
+    if (!t || t < acikKayit.alis_km) { setMesaj({ tip: 'err', metin: "GeÃ§erli bir teslim km girin (alÄ±ÅŸ km'den kÃ¼Ã§Ã¼k olamaz)." }); return; }
+    const katedilen = t - acikKayit.alis_km;
+    const { error: e1 } = await supabase
+      .from('arac_kullanim')
+      .update({ teslim_km: t, katedilen_km: katedilen, durum: 'KapalÄ±', teslim_saati: new Date().toISOString() })
+      .eq('id', acikKayit.id);
+    if (e1) { setMesaj({ tip: 'err', metin: e1.message }); return; }
+    await supabase.from('araclar').update({ durum: 'BoÅŸta', son_km: t }).eq('plaka', acikKayit.plaka);
+    setMesaj({ tip: 'ok', metin: 'AraÃ§ teslim edildi. Kat edilen: ' + katedilen.toLocaleString('tr-TR') + ' km' });
+    setTeslimKm('');
+    veriYukle();
+  }
+
+  if (yukleniyor) return <div className="loading-text">YÃ¼kleniyor...</div>;
+
+  const secilenArac = bostaAraclar.find((a) => a.plaka === plaka);
+
+  return (
+    <>
+      <div className="card">
+        <h2 className="section">AraÃ§ Filosu</h2>
+        <div className="grid cols-3" style={{ marginTop: 10 }}>
+          {tumAraclar.map((a) => {
+            const secilebilir = !acikKayit && a.durum === 'BoÅŸta';
+            const secili = secilebilir && plaka === a.plaka;
+            return (
+              <div
+                key={a.plaka}
+                className="card"
+                onClick={secilebilir ? () => plakaDegisti(a.plaka) : undefined}
+                style={{
+                  padding: 12,
+                  marginBottom: 0,
+                  cursor: secilebilir ? 'pointer' : 'default',
+                  opacity: secilebilir || acikKayit ? 1 : 0.55,
+                  border: secili ? '2px solid var(--accent-personel)' : '1px solid var(--border)',
+                  transition: 'border-color 0.15s',
+                }}
+              >
+                <div style={{
+                  width: '100%', height: 90, borderRadius: 8, background: '#F0F2EE',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', marginBottom: 8,
+                }}>
+                  {a.resim_url
+                    ? <img src={a.resim_url} alt={a.plaka} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    : <span style={{ fontSize: 28 }}>ğŸš</span>}
+                </div>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{[a.marka, a.model].filter(Boolean).join(' ') || 'Marka/model girilmedi'}</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>{a.plaka}</div>
+                <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span className={'status-tag' + (a.durum === 'BoÅŸta' ? ' open' : '')}>{a.durum}</span>
+                  {secili && <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-personel)' }}>âœ“ SeÃ§ili</span>}
+                </div>
+              </div>
+            );
+          })}
+          {tumAraclar.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z araÃ§ eklenmedi.</div>}
+        </div>
+      </div>
+
+      {acikKayit ? (
+        <div className="card">
+          <h2 className="section">AraÃ§ Teslim Et</h2>
+          <div className="loc-badge">
+            <div><div className="label">KullanÄ±mdaki araÃ§</div><div className="value">{acikKayit.plaka}</div></div>
+            <div><div className="label">AlÄ±ÅŸ km</div><div className="value">{acikKayit.alis_km.toLocaleString('tr-TR')}</div></div>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 8 }}>
+            AlÄ±ÅŸ saati: {new Date(acikKayit.tarih).toLocaleTimeString('tr-TR')}
+          </div>
+          <label>Teslim kilometresi</label>
+          <input type="number" value={teslimKm} onChange={(e) => setTeslimKm(e.target.value)} placeholder="Ã¶rn. 84350" />
+          {teslimKm && Number(teslimKm) - acikKayit.alis_km > 0 && (
+            <div className="km-diff">{(Number(teslimKm) - acikKayit.alis_km).toLocaleString('tr-TR')} km</div>
+          )}
+          <button className="action btn-punch cikis" onClick={teslimEt}>AracÄ± Teslim Et</button>
+          {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+        </div>
+      ) : (
+        <div className="card">
+          <h2 className="section">AraÃ§ Teslim Al</h2>
+          <label>Plaka seÃ§</label>
+          <select value={plaka} onChange={(e) => plakaDegisti(e.target.value)}>
+            {bostaAraclar.length === 0 && <option value="">BoÅŸta araÃ§ yok</option>}
+            {bostaAraclar.map((a) => (
+              <option key={a.plaka} value={a.plaka}>
+                {a.plaka}{(a.marka || a.model) ? ' Â· ' + [a.marka, a.model].filter(Boolean).join(' ') : ''}
+              </option>
+            ))}
+          </select>
+          <label>AlÄ±ÅŸ kilometresi</label>
+          <input type="number" value={alisKm} readOnly disabled style={{ background: '#F0F2EE', color: 'var(--ink-soft)' }} />
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>
+            AracÄ±n son bilinen kilometresi â€” deÄŸiÅŸtirilemez.
+          </div>
+          <button className="action btn-punch" onClick={teslimAl} disabled={!bostaAraclar.length}>AracÄ± Teslim Al</button>
+          {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+        </div>
+      )}
+
+      <div className="card">
+        <h2 className="section">GeÃ§miÅŸ AraÃ§ KullanÄ±mlarÄ±m</h2>
+        {gecmis.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>HenÃ¼z tamamlanmÄ±ÅŸ araÃ§ kullanÄ±mÄ±n yok.</div>}
+        {gecmis.length > 0 && (
+          <table>
+            <thead><tr><th>Tarih</th><th>Plaka</th><th>AlÄ±ÅŸ saati</th><th>AlÄ±ÅŸ km</th><th>Teslim saati</th><th>Teslim km</th><th>Kat edilen</th></tr></thead>
+            <tbody>
+              {gecmis.map((g) => (
+                <tr key={g.id}>
+                  <td>{new Date(g.tarih).toLocaleDateString('tr-TR')}</td>
+                  <td>{g.plaka}</td>
+                  <td>{new Date(g.tarih).toLocaleTimeString('tr-TR')}</td>
+                  <td>{Number(g.alis_km).toLocaleString('tr-TR')}</td>
+                  <td>{g.teslim_saati ? new Date(g.teslim_saati).toLocaleTimeString('tr-TR') : 'â€”'}</td>
+                  <td>{g.teslim_km ? Number(g.teslim_km).toLocaleString('tr-TR') : 'â€”'}</td>
+                  <td>{g.katedilen_km ? Number(g.katedilen_km).toLocaleString('tr-TR') + ' km' : 'â€”'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
+/* ---------------- SAHA VERÄ°SÄ° ---------------- */
+function VeriTab({ oturum, aktifLokasyon }) {
+  const [kalemTurleri, setKalemTurleri] = useState([]);
+  const [kalemTuru, setKalemTuru] = useState('');
+  const [miktar, setMiktar] = useState('');
+  const [birimFiyat, setBirimFiyat] = useState('');
+  const [aciklama, setAciklama] = useState('');
+  const [mesaj, setMesaj] = useState(null);
+  const [taraniyor, setTaraniyor] = useState(false);
+  const dosyaInputRef = useRef(null);
+
+  useEffect(() => {
+    supabase.from('kalem_turleri').select('*').then(({ data }) => setKalemTurleri(data || []));
+  }, []);
+
+  const toplam = (Number(miktar) || 0) * (Number(birimFiyat) || 0);
+
+  async function kaydet(otomatikVeri) {
+    if (!aktifLokasyon) {
+      setMesaj({ tip: 'err', metin: 'Ã–nce "Mesai" sekmesinden giriÅŸ yapÄ±p bugÃ¼nkÃ¼ lokasyonunuzu seÃ§melisiniz.' });
+      return;
+    }
+
+    const kt = otomatikVeri ? otomatikVeri.kalem_turu : kalemTuru;
+    const mk = otomatikVeri ? otomatikVeri.miktar : miktar;
+    const bf = otomatikVeri ? otomatikVeri.birim_fiyat : birimFiyat;
+    const ak = otomatikVeri ? otomatikVeri.aciklama : aciklama;
+    const tp = (Number(mk) || 0) * (Number(bf) || 0);
+
+    setMesaj(null);
+    if (!kt || !String(kt).trim() || !mk || !bf) {
+      setMesaj({ tip: 'err', metin: 'Kalem tÃ¼rÃ¼, miktar ve birim fiyat gerekli.' });
+      return;
+    }
+
+    if (!kalemTurleri.find((k) => k.ad === String(kt).trim())) {
+      await supabase.from('kalem_turleri').insert({ ad: String(kt).trim() });
+      setKalemTurleri((onceki) => [...onceki, { ad: String(kt).trim() }]);
+    }
+
+    const { error } = await supabase.from('saha_verileri').insert({
+      personel_no: oturum.personel_no,
+      ad: oturum.ad,
+      lokasyon: aktifLokasyon,
+      kalem_turu: String(kt).trim(),
+      miktar: Number(mk),
+      birim_fiyat: Number(bf),
+      toplam: tp,
+      aciklama: ak || null,
+    });
+    if (error) { setMesaj({ tip: 'err', metin: error.message }); return; }
+
+    setMesaj({
+      tip: 'ok',
+      metin: (otomatikVeri ? 'ğŸ“· FiÅŸten okundu ve kaydedildi. ' : 'Kaydedildi. ') + 'Toplam: ' + tp.toLocaleString('tr-TR') + ' TL',
+    });
+    setKalemTuru(''); setMiktar(''); setBirimFiyat(''); setAciklama('');
+  }
+
+  function kameraAc() {
+    dosyaInputRef.current?.click();
+  }
+
+  async function fisSecildi(e) {
+    const dosya = e.target.files?.[0];
+    e.target.value = '';
+    if (!dosya) return;
+    if (!aktifLokasyon) {
+      setMesaj({ tip: 'err', metin: 'Ã–nce "Mesai" sekmesinden giriÅŸ yapÄ±p bugÃ¼nkÃ¼ lokasyonunuzu seÃ§melisiniz.' });
+      return;
+    }
+
+    setMesaj(null);
+    setTaraniyor(true);
+
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const okuyucu = new FileReader();
+        okuyucu.onload = () => resolve(okuyucu.result);
+        okuyucu.onerror = () => reject(new Error('GÃ¶rsel okunamadÄ±.'));
+        okuyucu.readAsDataURL(dosya);
+      });
+
+      const yanit = await fetch('/api/fis-oku', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ image: base64, mediaType: dosya.type || 'image/jpeg' }),
+      });
+      const sonuc = await yanit.json();
+
+      if (!sonuc.basari || !sonuc.veri) {
+        setMesaj({ tip: 'err', metin: sonuc.mesaj || 'FiÅŸ okunamadÄ±, lÃ¼tfen bilgileri elle girin.' });
+        return;
+      }
+
+      const { kalem_turu, miktar: okunanMiktar, birim_fiyat, aciklama: okunanAciklama } = sonuc.veri;
+
+      setKalemTuru(kalem_turu || '');
+      setMiktar(okunanMiktar ?? '');
+      setBirimFiyat(birim_fiyat ?? '');
+      setAciklama(okunanAciklama || '');
+
+      if (kalem_turu && okunanMiktar && birim_fiyat) {
+        await kaydet({ kalem_turu, miktar: okunanMiktar, birim_fiyat, aciklama: okunanAciklama });
+      } else {
+        setMesaj({ tip: 'err', metin: 'FiÅŸten bazÄ± bilgiler net okunamadÄ±, lÃ¼tfen kontrol edip Kaydet\'e basÄ±n.' });
+      }
+    } catch (err) {
+      setMesaj({ tip: 'err', metin: err.message || 'FiÅŸ taranÄ±rken hata oluÅŸtu.' });
+    } finally {
+      setTaraniyor(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <h2 className="section">Saha Verisi Ekle</h2>
+
+      {aktifLokasyon ? (
+        <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 6 }}>
+          BugÃ¼nkÃ¼ lokasyon: <b style={{ color: 'var(--ink)' }}>{aktifLokasyon}</b>
+        </div>
+      ) : (
+        <div className="feedback err" style={{ marginTop: 6 }}>
+          Ã–nce "Mesai" sekmesinden giriÅŸ yapÄ±p bugÃ¼nkÃ¼ lokasyonunuzu seÃ§in.
+        </div>
+      )}
+
+      <input
+        ref={dosyaInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        style={{ display: 'none' }}
+        onChange={fisSecildi}
+      />
+      <button
+        type="button"
+        className="action btn-ai"
+        style={{ marginTop: 10 }}
+        onClick={kameraAc}
+        disabled={taraniyor || !aktifLokasyon}
+      >
+        {taraniyor ? 'ğŸ“· FiÅŸ okunuyor...' : 'ğŸ“· FiÅŸ Tara (Kamera)'}
+      </button>
+
+      <label style={{ marginTop: 16 }}>Kalem tÃ¼rÃ¼</label>
+      <div className="chip-row">
+        {kalemTurleri.map((k) => (
+          <span key={k.ad} className={'chip' + (kalemTuru === k.ad ? ' sel' : '')} onClick={() => setKalemTuru(k.ad)}>{k.ad}</span>
+        ))}
+      </div>
+      <input style={{ marginTop: 8 }} placeholder="veya yeni kalem tÃ¼rÃ¼ yazÄ±n" value={kalemTuru} onChange={(e) => setKalemTuru(e.target.value)} />
+      <label>Miktar</label>
+      <input type="number" step="0.01" value={miktar} onChange={(e) => setMiktar(e.target.value)} placeholder="0" />
+      <label>Birim fiyat (TL)</label>
+      <input type="number" step="0.01" value={birimFiyat} onChange={(e) => setBirimFiyat(e.target.value)} placeholder="0" />
+      <div className="total">Toplam: {toplam.toLocaleString('tr-TR')} TL</div>
+      <label>AÃ§Ä±klama (opsiyonel)</label>
+      <input value={aciklama} onChange={(e) => setAciklama(e.target.value)} placeholder="kÄ±sa not" />
+      <button className="action btn-secondary" onClick={() => kaydet()} disabled={!aktifLokasyon}>Kaydet</button>
+      {mesaj && <div className={'feedback ' + mesaj.tip}>{mesaj.metin}</div>}
+    </div>
+  );
+}
+
+
+===== app\globals.css =====
+:root {
+  --bg: #EEF1EC;
+  --card: #FFFFFF;
+  --ink: #1B2420;
+  --ink-soft: #5B6560;
+  --border: #DADFD8;
+  --accent-personel: #E8590C;
+  --accent-patron: #2B4C5C;
+  --accent-patron-soft: #E4EBEC;
+  --success: #2F8F5B;
+  --warn: #8A5A0F;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+}
+a { color: inherit; }
+
+.login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
+.login-card { background: var(--card); border-radius: 16px; padding: 32px 28px; width: 100%; max-width: 340px; border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(27,36,32,0.06); }
+.login-card h1 { font-size: 18px; margin: 0 0 4px; }
+.login-card p { color: var(--ink-soft); font-size: 13px; margin: 0 0 22px; }
+.login-card input { width: 100%; padding: 13px; margin-bottom: 12px; border-radius: 9px; border: 1px solid var(--border); font-size: 15px; background: #FAFBF9; }
+.login-card button { width: 100%; padding: 14px; border: none; border-radius: 10px; background: var(--ink); color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; margin-top: 6px; }
+.login-err { color: #B23B0E; font-size: 13px; margin-top: 10px; }
+.login-hint { margin-top: 18px; font-size: 12px; color: var(--ink-soft); line-height: 1.5; }
+
+.app-header { background: var(--card); border-bottom: 1px solid var(--border); padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 5; }
+.app-header .brand { font-weight: 700; font-size: 15px; }
+.app-header .who { font-size: 13px; color: var(--ink-soft); }
+.app-header .who b { color: var(--ink); }
+.logout { font-size: 12px; color: var(--ink-soft); background: none; border: 1px solid var(--border); border-radius: 7px; cursor: pointer; padding: 6px 10px; }
+
+.tabbar { display: flex; gap: 4px; background: var(--card); border-bottom: 1px solid var(--border); padding: 0 12px; overflow-x: auto; }
+.tabbar button { border: none; background: none; padding: 13px 14px; font-size: 13.5px; font-weight: 600; color: var(--ink-soft); cursor: pointer; white-space: nowrap; border-bottom: 3px solid transparent; }
+.tabbar button.active-personel { color: var(--ink); border-color: var(--accent-personel); }
+.tabbar button.active-patron { color: var(--ink); border-color: var(--accent-patron); }
+
+.content { padding: 20px 16px 60px; max-width: 1080px; margin: 0 auto; }
+
+.grid { display: grid; gap: 16px; }
+@media (min-width: 760px) { .grid.cols-2 { grid-template-columns: 1fr 1fr; } .grid.cols-3 { grid-template-columns: repeat(3, 1fr); } }
+
+.card { background: var(--card); border-radius: 14px; padding: 18px; border: 1px solid var(--border); margin-bottom: 16px; }
+h2.section { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); margin: 0 0 4px; }
+label { display: block; font-size: 12px; font-weight: 600; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.05em; margin: 14px 0 6px; }
+select, input { width: 100%; padding: 12px; border-radius: 9px; border: 1px solid var(--border); font-size: 15px; background: #FAFBF9; color: var(--ink); }
+button.action { border: none; border-radius: 10px; padding: 14px; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 14px; width: 100%; }
+.feedback { font-size: 14px; padding: 10px 12px; border-radius: 8px; margin-top: 12px; }
+.feedback.ok { background: #E4F3EA; color: var(--success); }
+.feedback.err { background: #FBE9E2; color: #B23B0E; }
+
+.clock { text-align: center; font-family: ui-monospace, monospace; font-size: 42px; font-weight: 600; margin: 4px 0 2px; }
+.date-label { text-align: center; color: var(--ink-soft); font-size: 13px; margin-bottom: 18px; text-transform: uppercase; letter-spacing: 0.06em; }
+.loc-badge { display: flex; align-items: center; justify-content: space-between; background: #FAF0E8; border-radius: 10px; padding: 12px 14px; }
+.loc-badge .label { font-size: 11px; color: #A0592A; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }
+.loc-badge .value { font-weight: 700; font-size: 15px; margin-top: 2px; }
+.status-row { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 16px 0 4px; font-size: 14px; color: var(--ink-soft); }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.dot.icerde { background: var(--success); }
+.dot.disarda { background: var(--accent-personel); }
+.btn-punch { background: var(--accent-personel); color: #fff; }
+.btn-punch.cikis { background: var(--ink); }
+.btn-secondary { background: #E4E9E1; color: var(--ink); }
+.total { text-align: right; font-family: ui-monospace, monospace; font-weight: 700; font-size: 16px; margin-top: 4px; }
+.km-diff { text-align: center; font-family: ui-monospace, monospace; font-size: 28px; font-weight: 700; margin: 10px 0 0; color: var(--accent-personel); }
+.chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.chip { background: #F0F2EE; border: 1px solid var(--border); border-radius: 20px; padding: 7px 13px; font-size: 13px; cursor: pointer; }
+.chip.sel { background: var(--accent-personel); color: #fff; border-color: var(--accent-personel); }
+
+.stat-card { background: var(--card); border-radius: 14px; padding: 18px; border: 1px solid var(--border); }
+.stat-card .label { font-size: 12px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }
+.stat-card .value { font-family: ui-monospace, monospace; font-size: 28px; font-weight: 700; margin-top: 6px; }
+.summary-total { font-family: ui-monospace, monospace; font-size: 30px; font-weight: 700; margin: 12px 0 2px; }
+.summary-sub { color: var(--ink-soft); font-size: 13px; }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+th, td { text-align: left; padding: 7px 5px; border-bottom: 1px solid var(--border); }
+th { color: var(--ink-soft); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+.btn-ai { background: var(--accent-patron); color: #fff; }
+.quote-box { background: var(--accent-patron-soft); border-radius: 10px; padding: 14px; margin-top: 16px; white-space: pre-wrap; font-size: 14px; line-height: 1.55; }
+.status-tag { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px; background: #F4E7D5; color: var(--warn); }
+.status-tag.open { background: #E4F3EA; color: #2F8F5B; }
+.tag-list { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.tag-pill { background: #F0F2EE; border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px; font-size: 12.5px; }
+.add-row { display: flex; gap: 8px; margin-top: 10px; }
+.add-row input { flex: 1; }
+.add-row button { border: none; background: var(--accent-patron); color: #fff; border-radius: 9px; padding: 0 16px; font-weight: 700; cursor: pointer; }
+.loading-text { text-align: center; color: var(--ink-soft); font-size: 14px; padding: 8px 0; }
+
+/* ---------------- KARANLIK MOD ---------------- */
+[data-theme="dark"] {
+  --bg: #14181A;
+  --card: #1E2427;
+  --ink: #ECEFEA;
+  --ink-soft: #93A098;
+  --border: #2E3538;
+  --accent-patron-soft: #223038;
+}
+[data-theme="dark"] .chip { background: #262D30; }
+[data-theme="dark"] .loc-badge { background: #2A2118; }
+[data-theme="dark"] .tag-pill { background: #262D30; }
+[data-theme="dark"] input, [data-theme="dark"] select { background: #171B1D; color: var(--ink); }
+[data-theme="dark"] .status-tag { background: #332A19; }
+[data-theme="dark"] .status-tag.open { background: #16261D; }
+[data-theme="dark"] .feedback.ok { background: #16261D; }
+[data-theme="dark"] .feedback.err { background: #2E1B14; }
+.theme-toggle {
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 7px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 14px;
+  margin-right: 8px;
+}
+
+
+===== app\layout.js =====
+import './globals.css';
+
+export const metadata = {
+  title: 'Saha Takip',
+  description: 'Saha personel, mesai, araÃ§ ve maliyet takip sistemi',
+  manifest: '/manifest.json',
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: 'default',
+    title: 'Saha Takip',
+  },
+};
+
+export const viewport = {
+  themeColor: '#E8590C',
+};
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="tr">
+      <head>
+        <link rel="apple-touch-icon" href="/icon-192.png" />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
+
+
+===== app\page.js =====
+'use client';
+
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabase';
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [personelNo, setPersonelNo] = useState('');
+  const [sifre, setSifre] = useState('');
+  const [hata, setHata] = useState('');
+  const [yukleniyor, setYukleniyor] = useState(false);
+
+  async function girisYap(e) {
+    e.preventDefault();
+    setHata('');
+    setYukleniyor(true);
+
+    const { data, error } = await supabase
+      .from('personel')
+      .select('*')
+      .eq('personel_no', personelNo.trim())
+      .eq('sifre', sifre)
+      .maybeSingle();
+
+    setYukleniyor(false);
+
+    if (error) {
+      setHata('BaÄŸlantÄ± hatasÄ±: ' + error.message);
+      return;
+    }
+    if (!data) {
+      setHata('Personel numarasÄ± veya ÅŸifre hatalÄ±.');
+      return;
+    }
+
+    localStorage.setItem('aktifOturum', JSON.stringify(data));
+    router.push(data.rol === 'patron' ? '/patron' : '/personel');
+  }
+
+  return (
+    <div className="login-wrap">
+      <form className="login-card" onSubmit={girisYap}>
+        <h1>Saha Takip</h1>
+        <p>Personel numaranÄ±z ve ÅŸifrenizle giriÅŸ yapÄ±n.</p>
+        <input
+          placeholder="KullanÄ±cÄ± adÄ± (Ã¶rn. mehmet.sahin veya 1001)"
+          value={personelNo}
+          onChange={(e) => setPersonelNo(e.target.value)}
+        />
+        <input
+          placeholder="Åifre"
+          type="password"
+          value={sifre}
+          onChange={(e) => setSifre(e.target.value)}
+        />
+        <button type="submit" disabled={yukleniyor}>
+          {yukleniyor ? 'Kontrol ediliyor...' : 'GiriÅŸ Yap'}
+        </button>
+        {hata && <div className="login-err">{hata}</div>}
+      </form>
+    </div>
+  );
+}
+
+
+
+===== lib\geo.js =====
+// Ä°ki GPS koordinatÄ± arasÄ±ndaki mesafeyi metre cinsinden hesaplar (Haversine formÃ¼lÃ¼).
+
+export function mesafeMetre(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // DÃ¼nya yarÄ±Ã§apÄ± (metre)
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
+// TarayÄ±cÄ±nÄ±n GPS konumunu bir Promise olarak dÃ¶ner.
+export function konumAl() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error('Bu cihaz/tarayÄ±cÄ± konum servisini desteklemiyor.'));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+      (err) => reject(new Error('Konum alÄ±namadÄ±: ' + err.message)),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
+}
+
+
+
+===== lib\supabase.js =====
+import { createClient } from '@supabase/supabase-js';
+
+export const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+);
+
+
+
+===== lib\theme.js =====
+// KaranlÄ±k mod iÃ§in basit yardÄ±mcÄ± fonksiyonlar. Tercih tarayÄ±cÄ±da saklanÄ±r.
+
+export function getInitialTheme() {
+  if (typeof window === 'undefined') return 'light';
+  return localStorage.getItem('tema') || 'light';
+}
+
+export function temaUygula(tema) {
+  if (typeof document === 'undefined') return;
+  document.documentElement.setAttribute('data-theme', tema);
+}
+
+export function temaDegistir(mevcutTema) {
+  const yeni = mevcutTema === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('tema', yeni);
+  temaUygula(yeni);
+  return yeni;
+}
+
+
+===== components\QrOkuyucu.js =====
+'use client';
+
+import { useEffect, useRef } from 'react';
+import { Html5Qrcode } from 'html5-qrcode';
+
+// Kamera aÃ§Ä±p QR kod okur. Bir kod okununca onOkundu(decodedText) Ã§aÄŸrÄ±lÄ±r.
+export default function QrOkuyucu({ onOkundu, onIptal }) {
+  const kutuId = 'qr-okuyucu-kutu';
+  const durdurulduRef = useRef(false);
+
+  useEffect(() => {
+    const scanner = new Html5Qrcode(kutuId);
+    durdurulduRef.current = false;
+
+    scanner
+      .start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 220, height: 220 } },
+        (decodedText) => {
+          if (durdurulduRef.current) return;
+          durdurulduRef.current = true;
+          scanner.stop().then(() => scanner.clear()).catch(() => {});
+          onOkundu(decodedText);
+        },
+        () => {} // kare okunamadÄ±ysa sessiz geÃ§, hata sayÄ±lmaz
+      )
+      .catch((err) => {
+        onIptal && onIptal('Kamera baÅŸlatÄ±lamadÄ±: ' + err);
+      });
+
+    return () => {
+      if (!durdurulduRef.current) {
+        scanner.stop().then(() => scanner.clear()).catch(() => {});
+      }
+    };
+  }, []); // eslint-disable-line
+
+  return (
+    <div>
+      <div id={kutuId} style={{ width: '100%', borderRadius: 10, overflow: 'hidden' }} />
+      <button className="action btn-secondary" onClick={() => onIptal && onIptal()} style={{ marginTop: 10 }}>
+        Ä°ptal
+      </button>
+    </div>
+  );
+}
+
+
+===== package.json =====
+{
+  "name": "saha-takip-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.0",
+    "html5-qrcode": "^2.3.8",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
+    "next": "16.2.10",
+    "qrcode": "^1.5.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "recharts": "^3.9.2",
+    "xlsx": "^0.18.5"
+  }
+}
+
+
+
+===== vercel.json =====
+{
+  "crons": [
+    {
+      "path": "/api/cron/daily",
+      "schedule": "0 17 * * *"
+    },
+    {
+      "path": "/api/cron/weekly",
+      "schedule": "0 17 * * 0"
+    },
+    {
+      "path": "/api/cron/monthly",
+      "schedule": "0 7 1 * *"
+    }
+  ]
+}
+
+
+

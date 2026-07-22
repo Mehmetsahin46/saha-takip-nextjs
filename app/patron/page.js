@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
@@ -10,7 +10,11 @@ import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
 import QRCode from 'qrcode';
 
-const KM_BIRIM_MALIYET = 5; // TL / km, tahmini yakıt + aşınma
+const KM_BIRIM_MALIYET = 5; // PLN / km, tahmini yakıt + aşınma
+
+function formatPLN(deger) {
+  return new Intl.NumberFormat('pl-PL', { style: 'currency', currency: 'PLN' }).format(Number(deger) || 0);
+}
 
 function excelIndir(veriler, dosyaAdi) {
   const ws = XLSX.utils.json_to_sheet(veriler);
@@ -26,7 +30,7 @@ function teklifPdfIndir(teklif) {
   doc.setFontSize(11);
   doc.text('Lokasyon: ' + teklif.lokasyon, 14, 28);
   doc.text('Tarih: ' + new Date(teklif.tarih).toLocaleString('tr-TR'), 14, 34);
-  doc.text('Toplam Maliyet: ' + Number(teklif.toplam_maliyet).toLocaleString('tr-TR') + ' TL', 14, 40);
+  doc.text('Toplam Maliyet: ' + formatPLN(teklif.toplam_maliyet), 14, 40);
   const satirlar = doc.splitTextToSize(teklif.teklif_metni, 180);
   doc.text(satirlar, 14, 50);
   doc.save('teklif-' + teklif.lokasyon.replace(/\s+/g, '-') + '.pdf');
@@ -47,6 +51,9 @@ export default function PatronPanel() {
   const [oturum, setOturum] = useState(null);
   const [tab, setTab] = useState('genel');
   const [tema, setTema] = useState('light');
+  const [yeniRaporSayisi, setYeniRaporSayisi] = useState(0);
+  const [bildirimKutusuAcik, setBildirimKutusuAcik] = useState(false);
+  const [yeniRaporlar, setYeniRaporlar] = useState([]);
 
   useEffect(() => {
     const kayit = localStorage.getItem('aktifOturum');
@@ -62,6 +69,36 @@ export default function PatronPanel() {
     temaUygula(t);
   }, []);
 
+  const defterBildirimYukle = useCallback(async () => {
+    const { data } = await supabase.from('santiye_defterleri').select('*').eq('durum', 'Yeni').order('created_at', { ascending: false });
+    setYeniRaporlar(data || []);
+    setYeniRaporSayisi(data ? data.length : 0);
+  }, []);
+
+  useEffect(() => { defterBildirimYukle(); }, [defterBildirimYukle]);
+
+  useEffect(() => {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    const kanal = supabase
+      .channel('patron-santiye-defteri')
+      .on('postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'santiye_defterleri' },
+        (payload) => {
+          defterBildirimYukle();
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            new Notification('📋 Yeni Şantiye Defteri Raporu!', {
+              body: (payload.new.formen_adi || 'Formen') + ' — ' + payload.new.lokasyon,
+              icon: '/favicon.ico',
+            });
+          }
+        }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(kanal); };
+  }, [defterBildirimYukle]);
+
   function cikisYapOturum() {
     localStorage.removeItem('aktifOturum');
     router.push('/');
@@ -74,7 +111,40 @@ export default function PatronPanel() {
       <div className="app-header">
         <span className="brand">Saha Takip</span>
         <span className="who">Yönetim Paneli — <b>Patron</b></span>
-        <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, position: 'relative' }}>
+          <button
+            onClick={() => setBildirimKutusuAcik(!bildirimKutusuAcik)}
+            style={{ position: 'relative', border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', borderRadius: 9, padding: '7px 10px', cursor: 'pointer', fontSize: 15 }}
+          >
+            🔔
+            {yeniRaporSayisi > 0 && (
+              <span style={{ position: 'absolute', top: -4, right: -4, background: '#D32F2F', color: '#fff', borderRadius: 10, padding: '2px 6px', fontSize: 11, fontWeight: 'bold', lineHeight: 1 }}>
+                {yeniRaporSayisi}
+              </span>
+            )}
+          </button>
+          {bildirimKutusuAcik && (
+            <div style={{ position: 'absolute', top: '110%', right: 0, width: 300, maxHeight: 360, overflowY: 'auto', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,0.2)', zIndex: 50, padding: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <b style={{ fontSize: 13 }}>Yeni Şantiye Defteri Raporları</b>
+                <span style={{ cursor: 'pointer', color: 'var(--ink-soft)' }} onClick={() => setBildirimKutusuAcik(false)}>✕</span>
+              </div>
+              {yeniRaporlar.length === 0 ? (
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>Yeni rapor yok.</div>
+              ) : (
+                yeniRaporlar.map((r) => (
+                  <div
+                    key={r.id}
+                    onClick={() => { setTab('defter'); setBildirimKutusuAcik(false); }}
+                    style={{ padding: '8px 6px', borderBottom: '1px solid var(--border)', cursor: 'pointer', fontSize: 12 }}
+                  >
+                    <b>{r.formen_adi}</b> — {r.lokasyon}
+                    <div style={{ color: 'var(--ink-soft)', fontSize: 11 }}>{new Date(r.created_at).toLocaleString('tr-TR')}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
           <button className="theme-toggle" onClick={() => setTema(temaDegistir(tema))}>{tema === 'dark' ? '☀️' : '🌙'}</button>
           <button className="logout" onClick={cikisYapOturum}>Çıkış</button>
         </div>
@@ -84,6 +154,9 @@ export default function PatronPanel() {
         <button className={tab === 'lokasyonlar' ? 'active-patron' : ''} onClick={() => setTab('lokasyonlar')}>Lokasyonlar</button>
         <button className={tab === 'araclar' ? 'active-patron' : ''} onClick={() => setTab('araclar')}>Araç Filosu</button>
         <button className={tab === 'gorevler' ? 'active-patron' : ''} onClick={() => setTab('gorevler')}>Görevler</button>
+        <button className={tab === 'defter' ? 'active-patron' : ''} onClick={() => setTab('defter')}>
+          📋 Şantiye Defteri{yeniRaporSayisi > 0 ? ' (' + yeniRaporSayisi + ')' : ''}
+        </button>
         <button className={tab === 'projeler' ? 'active-patron' : ''} onClick={() => setTab('projeler')}>Projeler</button>
         <button className={tab === 'teklifler' ? 'active-patron' : ''} onClick={() => setTab('teklifler')}>Teklifler</button>
         <button className={tab === 'ayarlar' ? 'active-patron' : ''} onClick={() => setTab('ayarlar')}>Ayarlar</button>
@@ -93,6 +166,7 @@ export default function PatronPanel() {
         {tab === 'lokasyonlar' && <Lokasyonlar />}
         {tab === 'araclar' && <Araclar />}
         {tab === 'gorevler' && <GorevlerTab />}
+        {tab === 'defter' && <SantiyeDefteriTab onDurumDegisti={defterBildirimYukle} />}
         {tab === 'projeler' && <ProjelerTab />}
         {tab === 'teklifler' && <Teklifler />}
         {tab === 'ayarlar' && <Ayarlar />}
@@ -111,6 +185,7 @@ function GenelBakis() {
   const [saatHafta, setSaatHafta] = useState(0);
   const [saatAy, setSaatAy] = useState(0);
   const [personelAySaat, setPersonelAySaat] = useState([]);
+  const [muayeneUyarilari, setMuayeneUyarilari] = useState([]);
 
   useEffect(() => {
     (async () => {
@@ -118,6 +193,18 @@ function GenelBakis() {
       const { count: acikSayisi } = await supabase.from('giris_cikis').select('*', { count: 'exact', head: true }).eq('durum', 'Açık');
       const { data: araclar } = await supabase.from('arac_kullanim').select('katedilen_km');
       const { data: mesailer } = await supabase.from('giris_cikis').select('*').eq('durum', 'Kapalı');
+      const { data: tumAraclar } = await supabase.from('araclar').select('plaka, marka, model, sonraki_muayene_tarihi');
+
+      const bugun = new Date(); bugun.setHours(0, 0, 0, 0);
+      const uyarilar = (tumAraclar || [])
+        .filter((a) => a.sonraki_muayene_tarihi)
+        .map((a) => {
+          const gunKalan = Math.round((new Date(a.sonraki_muayene_tarihi) - bugun) / 86400000);
+          return { ...a, gunKalan };
+        })
+        .filter((a) => a.gunKalan <= 10)
+        .sort((x, y) => x.gunKalan - y.gunKalan);
+      setMuayeneUyarilari(uyarilar);
 
       const tm = (veriler || []).reduce((a, v) => a + Number(v.toplam), 0);
       setToplamMaliyet(tm);
@@ -157,10 +244,133 @@ function GenelBakis() {
     })();
   }, []);
 
+  // EXCEL AKTARMA FONKSİYONU
+  const genelOzetExcelIndir = () => {
+    if (typeof excelIndir !== 'function') {
+      alert("excelIndir fonksiyonu bu dosyada tanımlı değil!");
+      return;
+    }
+    const veriler = [
+      { Kategori: 'Genel', Kalem: 'Toplam Maliyet', Deger: formatPLN(toplamMaliyet) },
+      { Kategori: 'Genel', Kalem: 'Şu An İçerideki Personel', Deger: icerdekiler + ' Kişi' },
+      { Kategori: 'Genel', Kalem: 'Toplam Kat Edilen KM', Deger: toplamKm.toLocaleString('tr-TR') + ' KM' },
+      { Kategori: 'Çalışma', Kalem: 'Bugün Toplam Saat', Deger: sureFormatla(saatGun) },
+      { Kategori: 'Çalışma', Kalem: 'Bu Hafta Toplam Saat', Deger: sureFormatla(saatHafta) },
+      { Kategori: 'Çalışma', Kalem: 'Bu Ay Toplam Saat', Deger: sureFormatla(saatAy) },
+      ...lokasyonOzet.map(l => ({ Kategori: 'Lokasyon Maliyeti', Kalem: l.lokasyon, Deger: formatPLN(l.toplam) + ' (' + l.adet + ' kalem)' })),
+      ...personelAySaat.map(p => ({ Kategori: 'Personel Mesai (Bu Ay)', Kalem: p.ad, Deger: sureFormatla(p.saat) }))
+    ];
+    excelIndir(veriler, 'genel-bakis-ozeti.xlsx');
+  };
+
+  // PDF AKTARMA FONKSİYONU
+  const genelOzetPdfIndir = () => {
+    const raporIcerik = `
+      <html>
+      <head>
+        <title>Saha Takip - Genel Bakış Raporu</title>
+        <style>
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 30px; color: #333; line-height: 1.5; }
+          .header { text-align: center; border-bottom: 2px solid #2B5876; padding-bottom: 15px; margin-bottom: 25px; }
+          .header h1 { margin: 0; font-size: 24px; color: #2B5876; }
+          .header p { margin: 5px 0 0 0; color: #666; font-size: 13px; }
+          table { width: 100%; border-collapse: collapse; margin-top: 15px; margin-bottom: 30px; }
+          th, td { border: 1px solid #e0e0e0; padding: 10px 12px; text-align: left; font-size: 13px; }
+          th { background-color: #f7f9fa; color: #2B5876; font-weight: bold; }
+          tr:nth-child(even) { background-color: #fafbfc; }
+          .section-title { font-size: 16px; font-weight: bold; color: #2B5876; margin-top: 20px; border-left: 4px solid #2B5876; padding-left: 8px; }
+          .footer { text-align: center; margin-top: 50px; font-size: 11px; color: #999; border-top: 1px solid #eee; padding-top: 10px; }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>📊 SAHA TAKİP SİSTEMİ</h1>
+          <p>Genel Bakış Yönetici Raporu &nbsp;|&nbsp; Tarih: ${new Date().toLocaleDateString('tr-TR')} ${new Date().toLocaleTimeString('tr-TR')}</p>
+        </div>
+
+        <div class="section-title">Genel Durum Özetleri</div>
+        <table>
+          <thead><tr><th>Metrik / Kalem</th><th>Mevcut Değer</th></tr></thead>
+          <tbody>
+            <tr><td>Toplam Birikmiş Maliyet</td><td><strong>${formatPLN(toplamMaliyet)}</strong></td></tr>
+            <tr><td>Şu An Sahada Aktif Olan Personel</td><td>${icerdekiler} Kişi</td></tr>
+            <tr><td>Araçlar Tarafından Kat Edilen Toplam Mesafe</td><td>${toplamKm.toLocaleString('tr-TR')} KM</td></tr>
+          </tbody>
+        </table>
+
+        <div class="section-title">Çalışma Süre Özetleri (Tüm Personel Toplamı)</div>
+        <table>
+          <thead><tr><th>Dönem</th><th>Toplam Çalışma Süresi</th></tr></thead>
+          <tbody>
+            <tr><td>Bugün</td><td>${sureFormatla(saatGun)}</td></tr>
+            <tr><td>Bu Hafta</td><td>${sureFormatla(saatHafta)}</td></tr>
+            <tr><td>Bu Ay</td><td>${sureFormatla(saatAy)}</td></tr>
+          </tbody>
+        </table>
+
+        <div class="section-title">Lokasyon Bazlı Maliyet Dağılımı</div>
+        <table>
+          <thead><tr><th>Lokasyon Adı</th><th>Giriş Yapılan Kalem Sayısı</th><th>Toplam Maliyet</th></tr></thead>
+          <tbody>
+            ${lokasyonOzet.map(l => `<tr><td>${l.lokasyon}</td><td>${l.adet} adet veri</td><td>${formatPLN(l.toplam)}</td></tr>`).join('')}
+            ${lokasyonOzet.length === 0 ? '<tr><td colspan="3">Kayıtlı maliyet verisi bulunmuyor.</td></tr>' : ''}
+          </tbody>
+        </table>
+
+        <div class="section-title">Personel Bazlı Aylık Toplam Mesai Listesi</div>
+        <table>
+          <thead><tr><th>Personel Ad Soyad</th><th>Bu Ayki Toplam Çalışma Süresi</th></tr></thead>
+          <tbody>
+            ${personelAySaat.map(p => `<tr><td>${p.ad}</td><td>${sureFormatla(p.saat)}</td></tr>`).join('')}
+            ${personelAySaat.length === 0 ? '<tr><td colspan="2">Bu ay tamamlanmış mesai kaydı bulunmuyor.</td></tr>' : ''}
+          </tbody>
+        </table>
+
+        <div class="footer">Bu rapor Saha Takip sistemi yönetim paneli üzerinden otomatik olarak üretilmiştir.</div>
+      </body>
+      </html>
+    `;
+    const pencere = window.open('', '_blank');
+    pencere.document.write(raporIcerik);
+    pencere.document.close();
+    pencere.print();
+  };
+
   return (
     <>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginBottom: 12 }}>
+        <button className="action btn-secondary" style={{ width: 'auto', padding: '8px 16px', fontSize: 13 }} onClick={genelOzetExcelIndir}>
+          📊 Excel'e Aktar
+        </button>
+        <button className="action btn-secondary" style={{ width: 'auto', padding: '8px 16px', fontSize: 13, backgroundColor: '#A83232', color: '#fff', borderColor: '#A83232' }} onClick={genelOzetPdfIndir}>
+          📄 PDF Raporu Al
+        </button>
+      </div>
+
+      {muayeneUyarilari.length > 0 && (
+        <div style={{ display: 'grid', gap: 8, marginBottom: 16 }}>
+          {muayeneUyarilari.map((a) => {
+            const gecti = a.gunKalan < 0;
+            return (
+              <div
+                key={a.plaka}
+                style={{
+                  padding: '10px 14px', borderRadius: 9, fontSize: 13, fontWeight: 600,
+                  background: gecti ? 'rgba(220, 38, 38, 0.14)' : 'rgba(245, 158, 11, 0.14)',
+                  color: gecti ? '#ef4444' : '#f59e0b',
+                  border: '1px solid ' + (gecti ? 'rgba(220, 38, 38, 0.3)' : 'rgba(245, 158, 11, 0.3)'),
+                }}
+              >
+                🔧 {[a.marka, a.model].filter(Boolean).join(' ')} ({a.plaka}) — muayene (przegląd){' '}
+                {gecti ? (Math.abs(a.gunKalan) + ' gün önce süresi geçti!') : (a.gunKalan + ' gün sonra doluyor')}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <div className="grid cols-3">
-        <div className="stat-card"><div className="label">Toplam maliyet</div><div className="value">{toplamMaliyet.toLocaleString('tr-TR')} TL</div></div>
+        <div className="stat-card"><div className="label">Toplam maliyet</div><div className="value">{formatPLN(toplamMaliyet)}</div></div>
         <div className="stat-card"><div className="label">Şu an içeride</div><div className="value">{icerdekiler} kişi</div></div>
         <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
       </div>
@@ -193,7 +403,7 @@ function GenelBakis() {
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                 <XAxis dataKey="lokasyon" tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} />
                 <YAxis tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} />
-                <Tooltip formatter={(v) => v.toLocaleString('tr-TR') + ' TL'} contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', fontSize: 12 }} />
+                <Tooltip formatter={(v) => formatPLN(v)} contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', fontSize: 12 }} />
                 <Bar dataKey="toplam" fill="var(--accent-patron)" radius={[6, 6, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -203,7 +413,7 @@ function GenelBakis() {
           <thead><tr><th>Lokasyon</th><th>Kalem</th><th>Toplam</th></tr></thead>
           <tbody>
             {lokasyonOzet.map((l) => (
-              <tr key={l.lokasyon}><td>{l.lokasyon}</td><td>{l.adet}</td><td>{l.toplam.toLocaleString('tr-TR')} TL</td></tr>
+              <tr key={l.lokasyon}><td>{l.lokasyon}</td><td>{l.adet}</td><td>{formatPLN(l.toplam)}</td></tr>
             ))}
           </tbody>
         </table>
@@ -256,7 +466,7 @@ function Lokasyonlar() {
       <select value={secili} onChange={(e) => setSecili(e.target.value)}>
         {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
       </select>
-      <div className="summary-total">{toplam.toLocaleString('tr-TR')} TL</div>
+      <div className="summary-total">{formatPLN(toplam)}</div>
       <div className="summary-sub">{kalemler.length} kalem girildi</div>
       <button
         className="action btn-secondary"
@@ -273,7 +483,7 @@ function Lokasyonlar() {
         <thead><tr><th>Kalem</th><th>Miktar</th><th>Birim</th><th>Toplam</th></tr></thead>
         <tbody>
           {kalemler.map((k) => (
-            <tr key={k.id}><td>{k.kalem_turu}</td><td>{k.miktar}</td><td>{k.birim_fiyat} TL</td><td>{Number(k.toplam).toLocaleString('tr-TR')} TL</td></tr>
+            <tr key={k.id}><td>{k.kalem_turu}</td><td>{k.miktar}</td><td>{formatPLN(k.birim_fiyat)}</td><td>{formatPLN(k.toplam)}</td></tr>
           ))}
         </tbody>
       </table>
@@ -294,11 +504,39 @@ function Araclar() {
   const [baslangicTarih, setBaslangicTarih] = useState('');
   const [bitisTarih, setBitisTarih] = useState('');
   const [personelArama, setPersonelArama] = useState('');
+  const [editInspectionPlaka, setEditInspectionPlaka] = useState(null);
+  const [sonMuayeneVal, setSonMuayeneVal] = useState('');
+  const [sonrakiMuayeneVal, setSonrakiMuayeneVal] = useState('');
+
+  function araclariYukle() {
+    supabase.from('araclar').select('*').then(({ data }) => setAraclar(data || []));
+  }
 
   useEffect(() => {
-    supabase.from('araclar').select('*').then(({ data }) => setAraclar(data || []));
+    araclariYukle();
     supabase.from('arac_kullanim').select('*').order('tarih', { ascending: false }).then(({ data }) => setKayitlar(data || []));
   }, []);
+
+  function muayeneDurumu(a) {
+    if (!a.sonraki_muayene_tarihi) return null;
+    const bugun = new Date(); bugun.setHours(0, 0, 0, 0);
+    const hedef = new Date(a.sonraki_muayene_tarihi);
+    const gunKalan = Math.round((hedef - bugun) / 86400000);
+    if (gunKalan < 0) return { seviye: 'gecti', gunKalan, metin: (Math.abs(gunKalan)) + ' gün önce süresi geçti!' };
+    if (gunKalan <= 10) return { seviye: 'yakin', gunKalan, metin: gunKalan + ' gün kaldı' };
+    return { seviye: 'normal', gunKalan, metin: gunKalan + ' gün kaldı' };
+  }
+
+  async function muayeneKaydet(plaka) {
+    if (!sonrakiMuayeneVal) { alert('Lütfen bir sonraki muayene tarihini girin.'); return; }
+    await supabase.from('araclar').update({
+      son_muayene_tarihi: sonMuayeneVal || null,
+      sonraki_muayene_tarihi: sonrakiMuayeneVal,
+    }).eq('plaka', plaka);
+    setEditInspectionPlaka(null);
+    setSonMuayeneVal(''); setSonrakiMuayeneVal('');
+    araclariYukle();
+  }
 
   let gosterilenKayitlar = seciliPlaka ? kayitlar.filter((k) => k.plaka === seciliPlaka) : kayitlar;
   if (baslangicTarih) gosterilenKayitlar = gosterilenKayitlar.filter((k) => new Date(k.tarih) >= new Date(baslangicTarih));
@@ -343,7 +581,7 @@ function Araclar() {
                 }}
               >
                 <div style={{
-                  width: '100%', height: 110, borderRadius: 8, background: '#F0F2EE',
+                  width: '100%', height: 110, borderRadius: 8, background: 'rgba(127, 127, 127, 0.12)',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', marginBottom: 10,
                 }}>
                   {a.resim_url
@@ -357,6 +595,44 @@ function Araclar() {
                   <span style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{(a.son_km || 0).toLocaleString('tr-TR')} km</span>
                   {secili && <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-patron)' }}>✓ Seçili</span>}
                 </div>
+
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }} onClick={(e) => e.stopPropagation()}>
+                  {muayeneDurumu(a) ? (
+                    <div style={{
+                      fontSize: 12, fontWeight: 700,
+                      color: muayeneDurumu(a).seviye === 'gecti' ? '#ef4444' : (muayeneDurumu(a).seviye === 'yakin' ? '#f59e0b' : 'var(--ink-soft)'),
+                    }}>
+                      🔧 Muayene (Przegląd): {muayeneDurumu(a).metin}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>🔧 Muayene tarihi girilmedi</div>
+                  )}
+
+                  {editInspectionPlaka === a.plaka ? (
+                    <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+                      <label style={{ margin: 0, fontSize: 11 }}>Son muayene tarihi</label>
+                      <input type="date" value={sonMuayeneVal} onChange={(e) => setSonMuayeneVal(e.target.value)} style={{ padding: 6, fontSize: 12 }} />
+                      <label style={{ margin: 0, fontSize: 11 }}>Bir sonraki muayene tarihi</label>
+                      <input type="date" value={sonrakiMuayeneVal} onChange={(e) => setSonrakiMuayeneVal(e.target.value)} style={{ padding: 6, fontSize: 12 }} />
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button className="action btn-secondary" style={{ width: 'auto', padding: '6px 10px', fontSize: 11, margin: 0 }} onClick={() => muayeneKaydet(a.plaka)}>Kaydet</button>
+                        <button className="action btn-secondary" style={{ width: 'auto', padding: '6px 10px', fontSize: 11, margin: 0 }} onClick={() => setEditInspectionPlaka(null)}>İptal</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      className="action btn-secondary"
+                      style={{ width: 'auto', padding: '6px 10px', fontSize: 11, marginTop: 6 }}
+                      onClick={() => {
+                        setEditInspectionPlaka(a.plaka);
+                        setSonMuayeneVal(a.son_muayene_tarihi || '');
+                        setSonrakiMuayeneVal(a.sonraki_muayene_tarihi || '');
+                      }}
+                    >
+                      📝 Muayene Tarihini Güncelle
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
@@ -367,7 +643,7 @@ function Araclar() {
       <div className="card" onClick={(e) => e.stopPropagation()}>
         <div className="grid cols-2">
           <div className="stat-card"><div className="label">Toplam kat edilen km</div><div className="value">{toplamKm.toLocaleString('tr-TR')} km</div></div>
-          <div className="stat-card"><div className="label">Tahmini araç maliyeti</div><div className="value">{(toplamKm * KM_BIRIM_MALIYET).toLocaleString('tr-TR')} TL</div></div>
+          <div className="stat-card"><div className="label">Tahmini araç maliyeti</div><div className="value">{formatPLN(toplamKm * KM_BIRIM_MALIYET)}</div></div>
         </div>
         <h2 className="section" style={{ marginTop: 18 }}>
           {seciliPlaka ? seciliPlaka + ' — kullanım geçmişi' : 'Araç kullanım geçmişi (tüm araçlar)'}
@@ -556,17 +832,200 @@ function GorevlerTab() {
                     <span className={'status-tag' + (g.durum === 'Tamamlandı' ? ' open' : '')}>{g.durum}</span>
                   </div>
                 </div>
-                <button onClick={() => gorevSil(g.id)} style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '4px 8px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
+                <button onClick={() => gorevSil(g.id)} style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 7, padding: '4px 8px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
               </div>
               <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                 {g.durum !== 'Bekliyor' && <button onClick={() => durumDegistir(g, 'Bekliyor')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'var(--card)', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Bekliyor yap</button>}
                 {g.durum !== 'Devam Ediyor' && <button onClick={() => durumDegistir(g, 'Devam Ediyor')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'var(--card)', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Devam Ediyor yap</button>}
-                {g.durum !== 'Tamamlandı' && <button onClick={() => durumDegistir(g, 'Tamamlandı')} style={{ fontSize: 11, border: '1px solid var(--border)', background: '#E4F3EA', color: '#2F8F5B', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Tamamlandı yap</button>}
+                {g.durum !== 'Tamamlandı' && <button onClick={() => durumDegistir(g, 'Tamamlandı')} style={{ fontSize: 11, border: '1px solid var(--border)', background: 'rgba(34, 197, 94, 0.16)', color: '#22c55e', borderRadius: 7, padding: '4px 8px', cursor: 'pointer' }}>Tamamlandı yap</button>}
               </div>
             </div>
           ))}
           {gosterilenGorevler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Gösterilecek görev yok.</div>}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- ŞANTİYE DEFTERİ (patron görüntüleme + düzenleme) ---------------- */
+function SantiyeDefteriTab({ onDurumDegisti }) {
+  const [raporlar, setRaporlar] = useState([]);
+  const [lokasyonFiltre, setLokasyonFiltre] = useState('Tümü');
+  const [lokasyonlar, setLokasyonlar] = useState([]);
+  const [acikRapor, setAcikRapor] = useState(null);
+  const [duzenleme, setDuzenleme] = useState(null);
+  const [kaydediliyor, setKaydediliyor] = useState(false);
+
+  async function raporlariYukle() {
+    const { data: r } = await supabase.from('santiye_defterleri').select('*').order('created_at', { ascending: false });
+    const { data: l } = await supabase.from('lokasyonlar').select('*');
+    setRaporlar(r || []);
+    setLokasyonlar(l || []);
+  }
+
+  useEffect(() => { raporlariYukle(); }, []);
+
+  async function raporAc(r) {
+    setAcikRapor(r);
+    setDuzenleme({
+      lokasyon: r.lokasyon,
+      saha_formen_sayisi: r.saha_formen_sayisi ?? 0,
+      saha_usta_sayisi: r.saha_usta_sayisi ?? 0,
+      saha_isci_sayisi: r.saha_isci_sayisi ?? 0,
+      ofis_personel_sayisi: r.ofis_personel_sayisi ?? 0,
+      arac_ekipman: r.arac_ekipman && r.arac_ekipman.length ? r.arac_ekipman : [{ cins: '', adet: '' }],
+      bugun_yapilan: r.bugun_yapilan || '',
+      yarin_yapilacak: r.yarin_yapilacak || '',
+      notlar: r.notlar || '',
+    });
+
+    if (r.durum === 'Yeni') {
+      await supabase.from('santiye_defterleri').update({ durum: 'Görüldü' }).eq('id', r.id);
+      raporlariYukle();
+      if (onDurumDegisti) onDurumDegisti();
+    }
+  }
+
+  function aracSatiriDegistir(i, alan, deger) {
+    setDuzenleme((onceki) => ({
+      ...onceki,
+      arac_ekipman: onceki.arac_ekipman.map((a, idx) => (idx === i ? { ...a, [alan]: deger } : a)),
+    }));
+  }
+  function aracSatiriEkle() {
+    setDuzenleme((onceki) => ({ ...onceki, arac_ekipman: [...onceki.arac_ekipman, { cins: '', adet: '' }] }));
+  }
+  function aracSatiriSil(i) {
+    setDuzenleme((onceki) => ({ ...onceki, arac_ekipman: onceki.arac_ekipman.filter((_, idx) => idx !== i) }));
+  }
+
+  async function degisiklikleriKaydet() {
+    setKaydediliyor(true);
+    const temizAraclar = duzenleme.arac_ekipman.filter((a) => a.cins.trim());
+    const { error } = await supabase.from('santiye_defterleri').update({
+      lokasyon: duzenleme.lokasyon,
+      saha_formen_sayisi: Number(duzenleme.saha_formen_sayisi) || 0,
+      saha_usta_sayisi: Number(duzenleme.saha_usta_sayisi) || 0,
+      saha_isci_sayisi: Number(duzenleme.saha_isci_sayisi) || 0,
+      ofis_personel_sayisi: Number(duzenleme.ofis_personel_sayisi) || 0,
+      arac_ekipman: temizAraclar,
+      bugun_yapilan: duzenleme.bugun_yapilan,
+      yarin_yapilacak: duzenleme.yarin_yapilacak || null,
+      notlar: duzenleme.notlar || null,
+    }).eq('id', acikRapor.id);
+    setKaydediliyor(false);
+    if (error) { alert(error.message); return; }
+    setAcikRapor(null);
+    setDuzenleme(null);
+    raporlariYukle();
+  }
+
+  async function raporSil(id) {
+    if (!confirm('Bu raporu silmek istediğinize emin misiniz?')) return;
+    await supabase.from('santiye_defterleri').delete().eq('id', id);
+    setAcikRapor(null);
+    raporlariYukle();
+  }
+
+  const gosterilenler = lokasyonFiltre === 'Tümü' ? raporlar : raporlar.filter((r) => r.lokasyon === lokasyonFiltre);
+
+  if (acikRapor && duzenleme) {
+    return (
+      <div className="card">
+        <button className="action btn-secondary" style={{ width: 'auto', marginBottom: 12 }} onClick={() => { setAcikRapor(null); setDuzenleme(null); }}>← Listeye dön</button>
+        <h2 className="section">📋 {acikRapor.formen_adi} — {new Date(acikRapor.created_at).toLocaleString('tr-TR')}</h2>
+
+        <label>Lokasyon</label>
+        <input value={duzenleme.lokasyon} onChange={(e) => setDuzenleme({ ...duzenleme, lokasyon: e.target.value })} />
+
+        <label style={{ marginTop: 12 }}>Saha personel sayıları</label>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--ink-soft)', marginBottom: 4 }}>Formen</div>
+            <input type="number" value={duzenleme.saha_formen_sayisi} onChange={(e) => setDuzenleme({ ...duzenleme, saha_formen_sayisi: e.target.value })} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--ink-soft)', marginBottom: 4 }}>Usta</div>
+            <input type="number" value={duzenleme.saha_usta_sayisi} onChange={(e) => setDuzenleme({ ...duzenleme, saha_usta_sayisi: e.target.value })} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--ink-soft)', marginBottom: 4 }}>Düz İşçi</div>
+            <input type="number" value={duzenleme.saha_isci_sayisi} onChange={(e) => setDuzenleme({ ...duzenleme, saha_isci_sayisi: e.target.value })} />
+          </div>
+        </div>
+
+        <label>Ofis / idari personel sayısı</label>
+        <input type="number" value={duzenleme.ofis_personel_sayisi} onChange={(e) => setDuzenleme({ ...duzenleme, ofis_personel_sayisi: e.target.value })} />
+
+        <label style={{ marginTop: 16 }}>Makina, Ekipman ve Araç Durumu</label>
+        <div style={{ display: 'grid', gap: 6 }}>
+          {duzenleme.arac_ekipman.map((a, i) => (
+            <div key={i} style={{ display: 'flex', gap: 6 }}>
+              <input placeholder="Cinsi" value={a.cins} onChange={(e) => aracSatiriDegistir(i, 'cins', e.target.value)} style={{ flex: 2 }} />
+              <input placeholder="Adet" type="number" value={a.adet} onChange={(e) => aracSatiriDegistir(i, 'adet', e.target.value)} style={{ flex: 1 }} />
+              {duzenleme.arac_ekipman.length > 1 && (
+                <button type="button" onClick={() => aracSatiriSil(i)} style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 7, padding: '0 12px', fontWeight: 700, cursor: 'pointer' }}>✕</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <button type="button" className="action btn-secondary" style={{ marginTop: 8 }} onClick={aracSatiriEkle}>+ Satır Ekle</button>
+
+        <label style={{ marginTop: 16 }}>Bugün Yapılan İşler</label>
+        <textarea rows={4} value={duzenleme.bugun_yapilan} onChange={(e) => setDuzenleme({ ...duzenleme, bugun_yapilan: e.target.value })} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', fontFamily: 'inherit', fontSize: 14 }} />
+
+        <label style={{ marginTop: 12 }}>Yarın Yapılacak İşler</label>
+        <textarea rows={3} value={duzenleme.yarin_yapilacak} onChange={(e) => setDuzenleme({ ...duzenleme, yarin_yapilacak: e.target.value })} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', fontFamily: 'inherit', fontSize: 14 }} />
+
+        <label style={{ marginTop: 12 }}>Notlar / Açıklamalar / Sıkıntılar</label>
+        <textarea rows={3} value={duzenleme.notlar} onChange={(e) => setDuzenleme({ ...duzenleme, notlar: e.target.value })} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--ink)', fontFamily: 'inherit', fontSize: 14 }} />
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+          <button className="action btn-ai" onClick={degisiklikleriKaydet} disabled={kaydediliyor}>
+            {kaydediliyor ? 'Kaydediliyor...' : 'Değişiklikleri Kaydet'}
+          </button>
+          <button
+            onClick={() => raporSil(acikRapor.id)}
+            style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 9, padding: '0 16px', fontWeight: 700, cursor: 'pointer' }}
+          >
+            Sil
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card">
+      <h2 className="section">📋 Şantiye Defteri — Formen Raporları</h2>
+      <label>Lokasyon filtrele</label>
+      <select value={lokasyonFiltre} onChange={(e) => setLokasyonFiltre(e.target.value)}>
+        <option>Tümü</option>
+        {lokasyonlar.map((l) => <option key={l.ad} value={l.ad}>{l.ad}</option>)}
+      </select>
+      <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+        {gosterilenler.map((r) => (
+          <div
+            key={r.id}
+            onClick={() => raporAc(r)}
+            style={{ border: '1px solid var(--border)', borderRadius: 9, padding: 10, cursor: 'pointer' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 8 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{r.lokasyon}</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2 }}>
+                  {r.formen_adi} · {new Date(r.created_at).toLocaleString('tr-TR')}
+                </div>
+                <div style={{ fontSize: 13, marginTop: 6, color: 'var(--ink-soft)' }}>
+                  {(r.bugun_yapilan || '').slice(0, 80)}{(r.bugun_yapilan || '').length > 80 ? '...' : ''}
+                </div>
+              </div>
+              <span className={'status-tag' + (r.durum === 'Görüldü' ? ' open' : '')}>{r.durum}</span>
+            </div>
+          </div>
+        ))}
+        {gosterilenler.length === 0 && <div style={{ color: 'var(--ink-soft)', fontSize: 13 }}>Henüz rapor gönderilmedi.</div>}
       </div>
     </div>
   );
@@ -798,7 +1257,7 @@ function Teklifler() {
       {gosterilenler.map((t) => (
         <div key={t.id} style={{ borderBottom: '1px solid var(--border)', padding: '10px 0', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
           <span>
-            {new Date(t.tarih).toLocaleString('tr-TR')} · {t.lokasyon} · {Number(t.toplam_maliyet).toLocaleString('tr-TR')} TL{' '}
+            {new Date(t.tarih).toLocaleString('tr-TR')} · {t.lokasyon} · {formatPLN(t.toplam_maliyet)}{' '}
             <span className="status-tag">{t.durum}</span>
           </span>
           <button
@@ -831,6 +1290,8 @@ function Ayarlar() {
   const [yeniMarka, setYeniMarka] = useState('');
   const [yeniModel, setYeniModel] = useState('');
   const [yeniResimDosya, setYeniResimDosya] = useState(null);
+  const [yeniSonMuayene, setYeniSonMuayene] = useState('');
+  const [yeniSonrakiMuayene, setYeniSonrakiMuayene] = useState('');
   const [ekleniyor, setEkleniyor] = useState(false);
   const [ypNo, setYpNo] = useState('');
   const [ypSifre, setYpSifre] = useState('');
@@ -969,8 +1430,11 @@ function Ayarlar() {
       marka: yeniMarka.trim() || null,
       model: yeniModel.trim() || null,
       resim_url: resimUrl,
+      son_muayene_tarihi: yeniSonMuayene || null,
+      sonraki_muayene_tarihi: yeniSonrakiMuayene || null,
     });
     setYeniPlaka(''); setYeniPlakaKm(''); setYeniMarka(''); setYeniModel(''); setYeniResimDosya(null);
+    setYeniSonMuayene(''); setYeniSonrakiMuayene('');
     setEkleniyor(false);
     hepsiniYukle();
   }
@@ -990,7 +1454,7 @@ function Ayarlar() {
       personel_no: ypNo.trim(), sifre: ypSifre.trim(), ad: ypAd.trim(), rol: ypRol,
     });
     if (error) { setYpMesaj({ tip: 'err', metin: error.message }); return; }
-    setYpMesaj({ tip: 'ok', metin: ypAd + ' eklendi (' + ypNo + ', ' + (ypRol === 'ustabasi' ? 'Ustabaşı' : 'Personel') + ').' });
+    setYpMesaj({ tip: 'ok', metin: ypAd + ' eklendi (' + ypNo + ', ' + (ypRol === 'formen' ? 'Formen' : 'Personel') + ').' });
     setYpNo(''); setYpSifre(''); setYpAd(''); setYpRol('personel');
     hepsiniYukle();
   }
@@ -1019,8 +1483,8 @@ function Ayarlar() {
             onClick={() => ayarGuncelle('konum_dogrulama_aktif', !ayarlar.konum_dogrulama_aktif)}
             style={{
               border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-              background: ayarlar.konum_dogrulama_aktif ? '#E4F3EA' : '#F0F2EE',
-              color: ayarlar.konum_dogrulama_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+              background: ayarlar.konum_dogrulama_aktif ? 'rgba(34, 197, 94, 0.16)' : 'rgba(127, 127, 127, 0.12)',
+              color: ayarlar.konum_dogrulama_aktif ? '#22c55e' : 'var(--ink-soft)',
             }}
           >
             {ayarlar.konum_dogrulama_aktif ? 'Aktif' : 'Pasif'}
@@ -1032,8 +1496,8 @@ function Ayarlar() {
             onClick={() => ayarGuncelle('qr_dogrulama_aktif', !ayarlar.qr_dogrulama_aktif)}
             style={{
               border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-              background: ayarlar.qr_dogrulama_aktif ? '#E4F3EA' : '#F0F2EE',
-              color: ayarlar.qr_dogrulama_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+              background: ayarlar.qr_dogrulama_aktif ? 'rgba(34, 197, 94, 0.16)' : 'rgba(127, 127, 127, 0.12)',
+              color: ayarlar.qr_dogrulama_aktif ? '#22c55e' : 'var(--ink-soft)',
             }}
           >
             {ayarlar.qr_dogrulama_aktif ? 'Aktif' : 'Pasif'}
@@ -1061,7 +1525,11 @@ function Ayarlar() {
               onClick={testEpostasiGonder}
               disabled={testGonderiliyor || !ayarlar.rapor_eposta}
               className="action btn-secondary"
-              style={{ width: 'auto', fontSize: 12, padding: '6px 12px', height: 'auto', cursor: 'pointer' }}
+              style={{
+                width: 'auto', fontSize: 12, padding: '6px 12px', height: 'auto', cursor: 'pointer',
+                background: 'var(--card)', color: 'var(--ink)', border: '1px solid var(--border)',
+                opacity: (testGonderiliyor || !ayarlar.rapor_eposta) ? 0.5 : 1,
+              }}
             >
               {testGonderiliyor ? 'Gönderiliyor...' : '⚡ Test E-postası Gönder'}
             </button>
@@ -1074,8 +1542,8 @@ function Ayarlar() {
             onClick={() => ayarGuncelle('gunluk_rapor_aktif', !ayarlar.gunluk_rapor_aktif)}
             style={{
               border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-              background: ayarlar.gunluk_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
-              color: ayarlar.gunluk_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+              background: ayarlar.gunluk_rapor_aktif ? 'rgba(34, 197, 94, 0.16)' : 'rgba(127, 127, 127, 0.12)',
+              color: ayarlar.gunluk_rapor_aktif ? '#22c55e' : 'var(--ink-soft)',
             }}
           >
             {ayarlar.gunluk_rapor_aktif ? 'Aktif' : 'Pasif'}
@@ -1087,8 +1555,8 @@ function Ayarlar() {
             onClick={() => ayarGuncelle('haftalik_rapor_aktif', !ayarlar.haftalik_rapor_aktif)}
             style={{
               border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-              background: ayarlar.haftalik_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
-              color: ayarlar.haftalik_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+              background: ayarlar.haftalik_rapor_aktif ? 'rgba(34, 197, 94, 0.16)' : 'rgba(127, 127, 127, 0.12)',
+              color: ayarlar.haftalik_rapor_aktif ? '#22c55e' : 'var(--ink-soft)',
             }}
           >
             {ayarlar.haftalik_rapor_aktif ? 'Aktif' : 'Pasif'}
@@ -1100,8 +1568,8 @@ function Ayarlar() {
             onClick={() => ayarGuncelle('aylik_rapor_aktif', !ayarlar.aylik_rapor_aktif)}
             style={{
               border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-              background: ayarlar.aylik_rapor_aktif ? '#E4F3EA' : '#F0F2EE',
-              color: ayarlar.aylik_rapor_aktif ? '#2F8F5B' : 'var(--ink-soft)',
+              background: ayarlar.aylik_rapor_aktif ? 'rgba(34, 197, 94, 0.16)' : 'rgba(127, 127, 127, 0.12)',
+              color: ayarlar.aylik_rapor_aktif ? '#22c55e' : 'var(--ink-soft)',
             }}
           >
             {ayarlar.aylik_rapor_aktif ? 'Aktif' : 'Pasif'}
@@ -1120,7 +1588,7 @@ function Ayarlar() {
                 </div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button onClick={() => qrGoster(l)} style={{ border: 'none', background: 'var(--accent-patron-soft)', color: 'var(--accent-patron)', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>QR</button>
-                  <button onClick={() => lokasyonSil(l.ad)} style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
+                  <button onClick={() => lokasyonSil(l.ad)} style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>Sil</button>
                 </div>
               </div>
             </div>
@@ -1166,7 +1634,7 @@ function Ayarlar() {
                   />
                   <button
                     onClick={() => kalemGuncelle(k.id)}
-                    style={{ border: 'none', background: '#E4F3EA', color: '#2F8F5B', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                    style={{ border: 'none', background: 'rgba(34, 197, 94, 0.16)', color: '#22c55e', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
                   >
                     Kaydet
                   </button>
@@ -1189,7 +1657,7 @@ function Ayarlar() {
                     </button>
                     <button
                       onClick={() => kalemSil(k.id, k.ad)}
-                      style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                      style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
                     >
                       Sil
                     </button>
@@ -1215,7 +1683,7 @@ function Ayarlar() {
               </div>
               <button
                 onClick={() => plakaSil(a.plaka, a.durum)}
-                style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
               >
                 Sil
               </button>
@@ -1230,6 +1698,10 @@ function Ayarlar() {
             <input placeholder="Model (örn. Transit)" value={yeniModel} onChange={(e) => setYeniModel(e.target.value)} />
           </div>
           <input placeholder="Başlangıç km" type="number" value={yeniPlakaKm} onChange={(e) => setYeniPlakaKm(e.target.value)} />
+          <label style={{ margin: '2px 0 0' }}>Son muayene tarihi (opsiyonel)</label>
+          <input type="date" value={yeniSonMuayene} onChange={(e) => setYeniSonMuayene(e.target.value)} />
+          <label style={{ margin: '2px 0 0' }}>Bir sonraki muayene tarihi (Przegląd — opsiyonel)</label>
+          <input type="date" value={yeniSonrakiMuayene} onChange={(e) => setYeniSonrakiMuayene(e.target.value)} />
           <label style={{ margin: '2px 0 0' }}>Araç fotoğrafı (opsiyonel)</label>
           <input type="file" accept="image/*" onChange={(e) => setYeniResimDosya(e.target.files?.[0] || null)} />
           <button onClick={plakaEkle} disabled={ekleniyor} style={{ border: 'none', background: 'var(--accent-patron)', color: '#fff', borderRadius: 9, padding: '10px 0', fontWeight: 700, cursor: 'pointer' }}>
@@ -1240,7 +1712,7 @@ function Ayarlar() {
       <div className="card">
         <h2 className="section">Personel Yönetimi</h2>
         <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, marginBottom: 10 }}>
-          Sadece <b>Ustabaşı</b> rolündeki kişiler Saha Verisi (masraf) girebilir. Personel rolü bu ekrana erişemez.
+          Sadece <b>Formen</b> rolündeki kişiler Saha Verisi (masraf) girebilir ve Şantiye Defteri raporu doldurabilir. Personel rolü bu ekranlara erişemez.
         </div>
         <div style={{ display: 'grid', gap: 8 }}>
           {tumPersonel.map((p) => (
@@ -1256,11 +1728,11 @@ function Ayarlar() {
                     style={{ padding: '5px 8px', fontSize: 12, width: 'auto' }}
                   >
                     <option value="personel">Personel</option>
-                    <option value="ustabasi">Ustabaşı</option>
+                    <option value="formen">Formen</option>
                   </select>
                   <button
                     onClick={() => personelSil(p.personel_no, p.ad)}
-                    style={{ border: 'none', background: '#FBE9E2', color: '#B23B0E', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                    style={{ border: 'none', background: 'rgba(220, 38, 38, 0.14)', color: '#ef4444', borderRadius: 7, padding: '5px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
                   >
                     Sil
                   </button>
@@ -1278,7 +1750,7 @@ function Ayarlar() {
         <label>Rol</label>
         <select value={ypRol} onChange={(e) => setYpRol(e.target.value)}>
           <option value="personel">Personel</option>
-          <option value="ustabasi">Ustabaşı</option>
+          <option value="formen">Formen</option>
         </select>
         <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>
           Lokasyon burada seçilmiyor — kişi ilk mesai girişinde kendi lokasyonunu seçecek.
